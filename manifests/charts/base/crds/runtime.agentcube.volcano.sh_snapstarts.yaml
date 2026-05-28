@@ -1,0 +1,333 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.2
+  name: snapstarts.runtime.agentcube.volcano.sh
+spec:
+  group: runtime.agentcube.volcano.sh
+  names:
+    kind: SnapStart
+    listKind: SnapStartList
+    plural: snapstarts
+    singular: snapstart
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.activeMode
+      name: ActiveMode
+      type: string
+    - jsonPath: .status.snapshot.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          SnapStart configures WarmForkSnapshot acceleration for a CodeInterpreter or AgentRuntime.
+          SnapStart is an independent CRD that references the runtime via runtimeRef.
+          CodeInterpreter / AgentRuntime objects are NOT modified by SnapStart.
+
+          Phase 1: only runtimeRef.kind=CodeInterpreter is supported.
+          Phase 2 (TODO): AgentRuntime (BrowserAgent WarmForkSnapshot).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: SnapStartSpec configures a WarmForkSnapshot for the referenced
+              runtime.
+            properties:
+              artifact:
+                description: |-
+                  Artifact configures snapshot artifact storage.
+                  Defaults to NodeLocal (Phase 1).
+                properties:
+                  distribution:
+                    allOf:
+                    - enum:
+                      - NodeLocal
+                      - LazyRemote
+                      - PreDistribute
+                    - enum:
+                      - NodeLocal
+                      - LazyRemote
+                      - PreDistribute
+                    default: NodeLocal
+                    description: |-
+                      Distribution is the artifact distribution mode.
+                      NodeLocal (default, Phase 1): snapshot artifact stays on the node that built it.
+                      LazyRemote (Phase 2, reserved): artifact is pulled from remote storage on-demand.
+                      PreDistribute (Phase 2, reserved): artifact is proactively pushed to target nodes.
+                    type: string
+                type: object
+              checkpoint:
+                default: InterpreterReady
+                description: |-
+                  Checkpoint is the name the runtime reports via GET /runtime/status when it is
+                  safe to snapshot. The controller polls this endpoint until safeToSnapshot=true.
+                  Standard values: InterpreterReady (picod), BrowserReady (browser agent).
+                type: string
+              invalidation:
+                description: Invalidation controls when an existing snapshot is considered
+                  stale.
+                properties:
+                  maxAge:
+                    default: 24h
+                    description: MaxAge is the maximum lifetime of a snapshot.
+                    type: string
+                  onArgsChange:
+                    default: true
+                    description: |-
+                      OnArgsChange invalidates the snapshot when container command or args change.
+                      Defaults to true. Same *bool rationale as OnImageDigestChange.
+                    type: boolean
+                  onImageDigestChange:
+                    default: true
+                    description: |-
+                      OnImageDigestChange invalidates the snapshot when the container image reference changes.
+                      For digest-pinned images (image@sha256:...), this detects digest changes via the image
+                      field. For tagged images, this detects tag string changes (e.g. nginx:1.0 → nginx:2.0).
+                      To also detect same-tag digest changes (nginx:latest pointing to a new digest), configure
+                      maxAge or trigger a manual rebuild via the force-rebuild annotation.
+                      Defaults to true. Use *bool (pointer) so that explicit false can be represented in JSON;
+                      a non-pointer bool with omitempty would silently omit false and revert to the default.
+                    type: boolean
+                type: object
+              runtimeRef:
+                description: RuntimeRef references the CodeInterpreter or AgentRuntime
+                  this SnapStart accelerates.
+                properties:
+                  kind:
+                    description: Kind is CodeInterpreter or AgentRuntime.
+                    enum:
+                    - CodeInterpreter
+                    - AgentRuntime
+                    type: string
+                  name:
+                    description: Name is the name of the referenced runtime object.
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
+              snapStartWarmPool:
+                description: |-
+                  SnapStartWarmPool configures the Kuasar VMM-layer pre-restored sandbox pool.
+                  Optional, disabled by default. See Section 3.4 for distinction from spec.warmPoolSize.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled activates the SnapStart warm pool. Default
+                      false.
+                    type: boolean
+                  size:
+                    default: 2
+                    description: Size is the target number of pre-restored ready sandboxes.
+                    format: int32
+                    maximum: 20
+                    minimum: 1
+                    type: integer
+                required:
+                - enabled
+                type: object
+            required:
+            - runtimeRef
+            type: object
+          status:
+            description: SnapStartStatus reports the current snapshot lifecycle state.
+            properties:
+              activeMode:
+                allOf:
+                - enum:
+                  - Cold
+                  - Snapshot
+                - enum:
+                  - Cold
+                  - Snapshot
+                description: |-
+                  ActiveMode is the authoritative answer to "what happens when I create a session?".
+                  Cold: sessions cold-start (snapshot not ready or failed).
+                  Snapshot: sessions restore from WarmForkSnapshot template.
+                type: string
+              conditions:
+                description: |-
+                  Conditions reports detailed sub-state as standard Kubernetes conditions.
+                  Known condition types:
+                    Degraded            — True when readyNodes < eligibleNodes; see snapshot.readyNodes/eligibleNodes.
+                    ProtocolNotSupported — True when the runtime does not implement /runtime/status
+                                          (persistent 404); snapshot build will not be retried.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              message:
+                description: Message is a human-readable description of the current
+                  state and next steps.
+                type: string
+              snapshot:
+                description: Snapshot reports the WarmForkSnapshot template lifecycle.
+                properties:
+                  artifact:
+                    description: Artifact reports the effective artifact storage type.
+                    properties:
+                      distribution:
+                        description: Distribution is the effective artifact distribution
+                          mode.
+                        enum:
+                        - NodeLocal
+                        - LazyRemote
+                        - PreDistribute
+                        type: string
+                    required:
+                    - distribution
+                    type: object
+                  buildFailureCount:
+                    description: |-
+                      BuildFailureCount tracks consecutive retryable snapshot build failures.
+                      SnapshotController stops automatic retries after three failed attempts.
+                    format: int32
+                    type: integer
+                  eligibleNodes:
+                    description: EligibleNodes is the total number of nodes targeted
+                      for snapshot builds.
+                    format: int32
+                    type: integer
+                  failedNodes:
+                    description: FailedNodes is the number of nodes where the snapshot
+                      build has permanently failed.
+                    format: int32
+                    type: integer
+                  failedReason:
+                    description: FailedReason contains the error when Phase=Failed.
+                    type: string
+                  nextBuildRetryAt:
+                    description: NextBuildRetryAt is the earliest time for the next
+                      automatic build retry.
+                    format: date-time
+                    type: string
+                  phase:
+                    allOf:
+                    - enum:
+                      - Pending
+                      - Creating
+                      - Ready
+                      - Failed
+                      - Invalidated
+                    - enum:
+                      - Pending
+                      - Creating
+                      - Ready
+                      - Failed
+                      - Invalidated
+                    description: |-
+                      Phase is the aggregate CRD-level snapshot lifecycle phase across all eligible nodes.
+                      Per-node CacheState is stored in Redis (SnapshotInfo.CacheState).
+                    type: string
+                  readyAt:
+                    description: ReadyAt is the time the aggregate snapshot first
+                      became Ready.
+                    format: date-time
+                    type: string
+                  readyNodes:
+                    description: ReadyNodes is the number of nodes with a LocalReady
+                      snapshot (available for restore).
+                    format: int32
+                    type: integer
+                  restoreFailureCount:
+                    description: |-
+                      RestoreFailureCount tracks consecutive restore failures across all nodes.
+                      SnapshotController marks the snapshot Invalidated when this reaches 3.
+                      Reset to 0 on successful rebuild.
+                    format: int32
+                    type: integer
+                  unavailableNodes:
+                    description: UnavailableNodes is the number of nodes that are
+                      currently unreachable or invalidated.
+                    format: int32
+                    type: integer
+                required:
+                - phase
+                type: object
+            required:
+            - activeMode
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

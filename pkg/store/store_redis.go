@@ -297,6 +297,121 @@ func (rs *redisStore) Close() error {
 	return rs.cli.Close()
 }
 
+// snapshotKey returns the Redis key for the snapshot Hash of a given runtime.
+func snapshotKey(namespace, name string) string {
+	return fmt.Sprintf("snapshot:%s:%s", namespace, name)
+}
+
+// StoreSnapshot writes or updates the snapshot record for a specific (runtime, node) pair.
+func (rs *redisStore) StoreSnapshot(ctx context.Context, namespace, name string, info *types.SnapshotInfo) error {
+	if info == nil {
+		return errors.New("StoreSnapshot: info is nil")
+	}
+	key := snapshotKey(namespace, name)
+	b, err := json.Marshal(info)
+	if err != nil {
+		return fmt.Errorf("StoreSnapshot: marshal info: %w", err)
+	}
+	if err := rs.cli.HSet(ctx, key, info.NodeName, string(b)).Err(); err != nil {
+		return fmt.Errorf("StoreSnapshot: HSET %s %s: %w", key, info.NodeName, err)
+	}
+	return nil
+}
+
+// GetSnapshotNodes returns all per-node snapshot records for the given runtime.
+func (rs *redisStore) GetSnapshotNodes(ctx context.Context, namespace, name string) ([]*types.SnapshotInfo, error) {
+	key := snapshotKey(namespace, name)
+	result, err := rs.cli.HGetAll(ctx, key).Result()
+	if err != nil {
+		return nil, fmt.Errorf("GetSnapshotNodes: HGETALL %s: %w", key, err)
+	}
+	infos := make([]*types.SnapshotInfo, 0, len(result))
+	for _, v := range result {
+		var info types.SnapshotInfo
+		if err := json.Unmarshal([]byte(v), &info); err != nil {
+			return nil, fmt.Errorf("GetSnapshotNodes: unmarshal: %w", err)
+		}
+		infos = append(infos, &info)
+	}
+	return infos, nil
+}
+
+// DeleteSnapshot removes the snapshot record for a specific (runtime, node) pair.
+func (rs *redisStore) DeleteSnapshot(ctx context.Context, namespace, name, nodeName string) error {
+	key := snapshotKey(namespace, name)
+	if err := rs.cli.HDel(ctx, key, nodeName).Err(); err != nil {
+		return fmt.Errorf("DeleteSnapshot: HDEL %s %s: %w", key, nodeName, err)
+	}
+	return nil
+}
+
+// DeleteAllSnapshots removes all per-node snapshot records for a runtime.
+func (rs *redisStore) DeleteAllSnapshots(ctx context.Context, namespace, name string) error {
+	key := snapshotKey(namespace, name)
+	if err := rs.cli.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("DeleteAllSnapshots: DEL %s: %w", key, err)
+	}
+	return nil
+}
+
+// ListSnapshotTemplateIDs returns all tracked template IDs across all runtimes and nodes.
+func (rs *redisStore) ListSnapshotTemplateIDs(ctx context.Context) ([]string, error) {
+	var cursor uint64
+	var ids []string
+	for {
+		keys, nextCursor, err := rs.cli.Scan(ctx, cursor, "snapshot:*", 100).Result()
+		if err != nil {
+			return nil, fmt.Errorf("ListSnapshotTemplateIDs: SCAN: %w", err)
+		}
+		for _, key := range keys {
+			fields, err := rs.cli.HGetAll(ctx, key).Result()
+			if err != nil {
+				continue
+			}
+			for _, v := range fields {
+				var info types.SnapshotInfo
+				if err := json.Unmarshal([]byte(v), &info); err != nil {
+					continue
+				}
+				if info.TemplateID != "" {
+					ids = append(ids, info.TemplateID)
+				}
+			}
+		}
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
+	return ids, nil
+}
+
+// ListAllSnapshotKeys returns all [namespace, name] pairs that have snapshot data.
+// It scans keys matching "snapshot:*" and parses the namespace and name from each key.
+func (rs *redisStore) ListAllSnapshotKeys(ctx context.Context) ([][2]string, error) {
+	var cursor uint64
+	var pairs [][2]string
+	for {
+		keys, nextCursor, err := rs.cli.Scan(ctx, cursor, "snapshot:*", 100).Result()
+		if err != nil {
+			return nil, fmt.Errorf("ListAllSnapshotKeys: SCAN: %w", err)
+		}
+		for _, key := range keys {
+			rest := strings.TrimPrefix(key, "snapshot:")
+			idx := strings.Index(rest, ":")
+			if idx < 0 {
+				continue
+			}
+			pairs = append(pairs, [2]string{rest[:idx], rest[idx+1:]})
+		}
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
+	return pairs, nil
+}
+
 // UpdateSessionLastActivity updates the last-activity index for the given session.
 func (rs *redisStore) UpdateSessionLastActivity(ctx context.Context, sessionID string, at time.Time) error {
 	if sessionID == "" {

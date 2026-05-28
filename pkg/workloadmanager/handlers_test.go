@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,9 +35,12 @@ import (
 	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
 	"github.com/volcano-sh/agentcube/pkg/common/types"
 	"github.com/volcano-sh/agentcube/pkg/store"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
@@ -48,6 +52,7 @@ type fakeStore struct {
 	updateErr   error
 	storeCalls  int
 	updateCalls int
+	snapInfos   []*types.SnapshotInfo // returned by GetSnapshotNodes; nil = no snapshots
 }
 
 func (f *fakeStore) Ping(_ context.Context) error { return nil }
@@ -73,6 +78,20 @@ func (f *fakeStore) UpdateSessionLastActivity(_ context.Context, _ string, _ tim
 	return nil
 }
 func (f *fakeStore) Close() error { return nil }
+func (f *fakeStore) StoreSnapshot(_ context.Context, _, _ string, _ *types.SnapshotInfo) error {
+	return nil
+}
+func (f *fakeStore) GetSnapshotNodes(_ context.Context, _, _ string) ([]*types.SnapshotInfo, error) {
+	return f.snapInfos, nil
+}
+func (f *fakeStore) DeleteSnapshot(_ context.Context, _, _, _ string) error  { return nil }
+func (f *fakeStore) DeleteAllSnapshots(_ context.Context, _, _ string) error { return nil }
+func (f *fakeStore) ListSnapshotTemplateIDs(_ context.Context) ([]string, error) {
+	return nil, nil
+}
+func (f *fakeStore) ListAllSnapshotKeys(_ context.Context) ([][2]string, error) {
+	return nil, nil
+}
 
 func readySandbox() *sandboxv1alpha1.Sandbox {
 	return &sandboxv1alpha1.Sandbox{
@@ -530,4 +549,158 @@ func TestHandleDeleteSandbox_DetachedContext(t *testing.T) {
 
 	require.True(t, storeDeleteCalled, "DeleteSandboxBySessionID should be called even if the request context is canceled")
 	require.Equal(t, http.StatusOK, w.Code)
+}
+
+// ---------------------------------------------------------------------------
+// handleSandboxCreate restore gate branches
+// ---------------------------------------------------------------------------
+
+// TestHandleSandboxCreate_RestoreGateBranches verifies that the SnapStart status
+// checks (ActiveMode, published placements) correctly decide cold-start vs restore.
+// The observable signal is the forceDirectSandbox flag passed to buildSandboxByCodeInterpreter:
+//   - true  → restore path selected (readySnap != nil)
+//   - false → cold start
+func TestHandleSandboxCreate_RestoreGateBranches(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// CI that will be returned by the informer.
+	ci := makeCI("img:v1", "", nil)
+	ci.Namespace = "ns"
+	ci.Name = "workload"
+	specHash := computeSpecHashNoImage(ci)
+	templateKey := "fork:sha256-abc:InterpreterReady:" + specHash
+
+	// Snapshot info in Redis that matches the CI in all mandatory version fields.
+	snapInfo := &types.SnapshotInfo{
+		NodeName:        "node-a",
+		CacheState:      string(runtimev1alpha1.CacheStateLocalReady),
+		SpecHash:        specHash,
+		ImageRef:        "img:v1",
+		Checkpoint:      "InterpreterReady",
+		ProtocolVersion: "1",
+		TemplateKey:     templateKey,
+	}
+
+	// Helper: build a SnapStart with the given activeMode.
+	makeSnapStart := func(activeMode runtimev1alpha1.SessionStartupMode) *runtimev1alpha1.SnapStart {
+		return &runtimev1alpha1.SnapStart{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ss-test"},
+			Spec: runtimev1alpha1.SnapStartSpec{
+				RuntimeRef: runtimev1alpha1.RuntimeReference{Kind: "CodeInterpreter", Name: "workload"},
+				Checkpoint: "InterpreterReady",
+			},
+			Status: runtimev1alpha1.SnapStartStatus{ActiveMode: activeMode},
+		}
+	}
+
+	cases := []struct {
+		name        string
+		snapStarts  []*runtimev1alpha1.SnapStart
+		wantRestore bool
+	}{
+		{
+			name:        "no SnapStart in indexer → cold start",
+			snapStarts:  nil,
+			wantRestore: false,
+		},
+		{
+			name:        "SnapStart ActiveMode=Cold → cold start",
+			snapStarts:  []*runtimev1alpha1.SnapStart{makeSnapStart(runtimev1alpha1.SessionStartupModeCold)},
+			wantRestore: false,
+		},
+		{
+			name:        "SnapStart ActiveMode=Snapshot → restore from Redis",
+			snapStarts:  []*runtimev1alpha1.SnapStart{makeSnapStart(runtimev1alpha1.SessionStartupModeSnapshot)},
+			wantRestore: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// CI informer: getCodeInterpreter looks up by "namespace/name".
+			ciStore := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			require.NoError(t, ciStore.Add(ciToUnstructured(t, ci)))
+
+			// Node informer: selectReadySnapshotNode checks isNodeCurrentlyReady.
+			nodeStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+			require.NoError(t, nodeStore.Add(&corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "node-a",
+					Labels: map[string]string{types.LabelKuasarSnapstart: "true"},
+				},
+				Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				}},
+			}))
+
+			// Fake clientset: getEligibleNodesForCI calls Nodes().List().
+			cs := fake.NewSimpleClientset(&corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "node-a",
+					Labels: map[string]string{types.LabelKuasarSnapstart: "true"},
+				},
+				Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+				}},
+			})
+
+			// SnapStart indexer: configured per test case.
+			idx := newSnapStartIndexer()
+			for _, ss := range tc.snapStarts {
+				idx.upsert(ss)
+			}
+
+			sc := &SnapshotController{
+				clientset: cs,
+				informers: &Informers{
+					CodeInterpreterInformer: &fakeSharedIndexInformer{testStore: ciStore},
+				},
+				indexer: idx,
+			}
+
+			// Store returns the pre-built snapshot info so the version gate has data to evaluate.
+			fakeStoreInst := &fakeStore{snapInfos: []*types.SnapshotInfo{snapInfo}}
+
+			server := &Server{
+				config:             &Config{SandboxReadyProbeTimeout: 5 * time.Millisecond, SandboxReadyProbeInterval: time.Millisecond},
+				k8sClient:          &K8sClient{},
+				sandboxController:  &SandboxReconciler{},
+				storeClient:        fakeStoreInst,
+				snapshotController: sc,
+				informers: &Informers{
+					NodeInformer: &fakeSharedIndexInformer{testStore: nodeStore},
+				},
+			}
+
+			var gotForceDirectSandbox bool
+			patches := gomonkey.NewPatches()
+			defer patches.Reset()
+
+			patches.ApplyFunc(buildSandboxByCodeInterpreter,
+				func(_, _ string, _ *Informers, fds bool) (*sandboxv1alpha1.Sandbox, *extensionsv1alpha1.SandboxClaim, *sandboxEntry, error) {
+					gotForceDirectSandbox = fds
+					sb, entry := makeSandbox(types.CodeInterpreterKind, "ns", "workload")
+					return sb, &extensionsv1alpha1.SandboxClaim{
+						ObjectMeta: metav1.ObjectMeta{Name: sb.Name, Namespace: sb.Namespace},
+					}, entry, nil
+				})
+
+			patches.ApplyPrivateMethod(reflect.TypeOf(server), "createSandbox",
+				func(_ *Server, _ context.Context, _ dynamic.Interface, _ *sandboxv1alpha1.Sandbox, _ *extensionsv1alpha1.SandboxClaim, _ *sandboxEntry, _ <-chan SandboxStatusUpdate) (*types.CreateSandboxResponse, error) {
+					return &types.CreateSandboxResponse{SessionID: "sess-1"}, nil
+				})
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/",
+				strings.NewReader(`{"name":"workload","namespace":"ns"}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			server.handleSandboxCreate(c, types.CodeInterpreterKind)
+
+			require.Equal(t, http.StatusOK, w.Code, "expected 200 for test case %q", tc.name)
+			require.Equal(t, tc.wantRestore, gotForceDirectSandbox,
+				"forceDirectSandbox mismatch for case %q", tc.name)
+		})
+	}
 }

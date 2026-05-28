@@ -71,6 +71,7 @@ type K8sClient struct {
 	informerFactory informers.SharedInformerFactory
 	podInformer     cache.SharedIndexInformer
 	podLister       listersv1.PodLister
+	nodeInformer    cache.SharedIndexInformer
 }
 
 type sandboxEntry struct {
@@ -127,6 +128,7 @@ func NewK8sClient() (*K8sClient, error) {
 	// Get pod informer and lister
 	podInformer := informerFactory.Core().V1().Pods().Informer()
 	podLister := informerFactory.Core().V1().Pods().Lister()
+	nodeInformer := informerFactory.Core().V1().Nodes().Informer()
 
 	return &K8sClient{
 		clientset:       clientset,
@@ -138,6 +140,7 @@ func NewK8sClient() (*K8sClient, error) {
 		informerFactory: informerFactory,
 		podInformer:     podInformer,
 		podLister:       podLister,
+		nodeInformer:    nodeInformer,
 	}, nil
 }
 

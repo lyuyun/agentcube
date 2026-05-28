@@ -21,7 +21,7 @@ if [ -d "vendor/k8s.io/code-generator" ]; then
 else
 	# Ensure code-generator is downloaded
 	echo "Ensuring code-generator@${CODEGEN_VERSION} is available..."
-	go get -d "k8s.io/code-generator@${CODEGEN_VERSION}" || true
+	go mod download "k8s.io/code-generator@${CODEGEN_VERSION}" || true
 	
 	# Find code-generator in module cache
 	CODEGEN_PKG=$(go list -m -f '{{.Dir}}' "k8s.io/code-generator@${CODEGEN_VERSION}" 2>/dev/null || echo "")
@@ -71,9 +71,11 @@ find "${SCRIPT_ROOT}/client-go/listers" -name "*.go" -type f | while read -r fil
   if [[ "$OSTYPE" == "darwin"* ]]; then
     sed -i '' 's/runtimev1alpha1\.Resource("codeinterpreter")/runtimev1alpha1.Resource("codeinterpreter").GroupResource()/g' "$file"
     sed -i '' 's/runtimev1alpha1\.Resource("agentruntime")/runtimev1alpha1.Resource("agentruntime").GroupResource()/g' "$file"
+    sed -i '' 's/runtimev1alpha1\.Resource("snapstart")/runtimev1alpha1.Resource("snapstart").GroupResource()/g' "$file"
   else
     sed -i 's/runtimev1alpha1\.Resource("codeinterpreter")/runtimev1alpha1.Resource("codeinterpreter").GroupResource()/g' "$file"
     sed -i 's/runtimev1alpha1\.Resource("agentruntime")/runtimev1alpha1.Resource("agentruntime").GroupResource()/g' "$file"
+    sed -i 's/runtimev1alpha1\.Resource("snapstart")/runtimev1alpha1.Resource("snapstart").GroupResource()/g' "$file"
   fi
 done
 

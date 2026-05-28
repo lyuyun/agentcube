@@ -33,3 +33,11 @@ type CodeInterpreterListerExpansion interface{}
 // CodeInterpreterNamespaceListerExpansion allows custom methods to be added to
 // CodeInterpreterNamespaceLister.
 type CodeInterpreterNamespaceListerExpansion interface{}
+
+// SnapStartListerExpansion allows custom methods to be added to
+// SnapStartLister.
+type SnapStartListerExpansion interface{}
+
+// SnapStartNamespaceListerExpansion allows custom methods to be added to
+// SnapStartNamespaceLister.
+type SnapStartNamespaceListerExpansion interface{}

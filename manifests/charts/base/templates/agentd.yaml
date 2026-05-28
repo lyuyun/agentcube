@@ -1,0 +1,105 @@
+{{- if .Values.agentd.enabled }}
+{{- if not .Values.agentd.kuasarProxyToken }}
+{{- fail "agentd.kuasarProxyToken must be set when agentd.enabled=true" }}
+{{- end }}
+# Bearer token used by SnapshotController to authenticate to the Kuasar Admin Proxy.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agentd-kuasar-proxy-token
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: agentd
+type: Opaque
+stringData:
+  token: {{ .Values.agentd.kuasarProxyToken | quote }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentd
+  namespace: {{ .Release.Namespace }}
+---
+# DaemonSet: runs on every node with the agentcube.volcano.sh/kuasar-snapstart=true label.
+# Proxies SnapshotController → Kuasar Admin Unix socket for create-template / delete-template.
+# Authentication: Bearer token (shared secret, stored in agentd-kuasar-proxy-token Secret).
+# Access further restricted to Workload Manager pods by the NetworkPolicy below.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: agentd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: agentd
+spec:
+  selector:
+    matchLabels:
+      app: agentd
+  template:
+    metadata:
+      labels:
+        app: agentd
+    spec:
+      serviceAccountName: agentd
+      nodeSelector:
+        agentcube.volcano.sh/kuasar-snapstart: "true"
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: agentd
+          image: "{{ .Values.agentd.image.repository }}:{{ .Values.agentd.image.tag }}"
+          imagePullPolicy: {{ .Values.agentd.image.pullPolicy }}
+          ports:
+            - name: kuasar-proxy
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KUASAR_PROXY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agentd-kuasar-proxy-token
+                  key: token
+          volumeMounts:
+            - name: kuasar-admin-socket
+              mountPath: /run/vmm-sandboxer-admin.sock
+          resources:
+            {{- toYaml .Values.agentd.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: kuasar-admin-socket
+          hostPath:
+            path: /run/vmm-sandboxer-admin.sock
+            type: Socket
+---
+# NetworkPolicy: restrict inbound traffic on port 9090 to Workload Manager pods only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agentd-kuasar-proxy
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: agentd
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: workloadmanager
+      ports:
+        - protocol: TCP
+          port: 9090
+{{- end }}

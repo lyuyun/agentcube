@@ -18,11 +18,13 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/klog/v2"
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -46,7 +48,6 @@ func main() {
 			BindAddress: "0", // Disable metrics server
 		},
 		HealthProbeBindAddress: "0", // Disable health probe server
-
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to start manager: %v\n", err)
@@ -62,6 +63,20 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to create controller: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Start the Kuasar Admin Proxy to allow SnapshotController (running in Workload Manager)
+	// to create/delete WarmFork snapshot templates on this node via the Kuasar Admin socket.
+	listenAddr, listenErr := agentd.DefaultListenAddr()
+	if listenErr != nil {
+		klog.Errorf("KuasarAdminProxy: %v (proxy will not start)", listenErr)
+	} else {
+		proxy := agentd.NewKuasarAdminProxy(listenAddr, "", agentd.DefaultToken())
+		go func() {
+			if startErr := proxy.Start(); startErr != nil && startErr != http.ErrServerClosed {
+				klog.Errorf("KuasarAdminProxy: %v", startErr)
+			}
+		}()
 	}
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {

@@ -20,11 +20,21 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"k8s.io/klog/v2"
 )
+
+// snapstartBuildMode is true when AGENTCUBE_SNAPSTART_BUILD=true, indicating
+// this picod instance is a snapshot build sandbox and should implement
+// the WarmFork Ready-Waiting protocol.
+var snapstartBuildMode = os.Getenv("AGENTCUBE_SNAPSTART_BUILD") == "true"
+
+// safeToSnapshot is atomically set to 1 once picod has entered the
+// InjectionWaiting state (accept() loop is running, no user state loaded).
+var safeToSnapshot int32
 
 const (
 	// MaxBodySize limits request body size to prevent memory exhaustion
@@ -44,6 +54,12 @@ type Server struct {
 	authManager  *AuthManager
 	startTime    time.Time
 	workspaceDir string
+	// snapReady is closed once picod has entered InjectionWaiting state.
+	// Used to signal the HTTP goroutine that safeToSnapshot can be set.
+	snapReady chan struct{}
+	// activeTaskCount tracks the number of in-flight /api/execute requests.
+	// Accessed atomically; must not be baked into a WarmFork snapshot.
+	activeTaskCount int32
 }
 
 // NewServer creates a new PicoD server instance
@@ -52,6 +68,7 @@ func NewServer(config Config) *Server {
 		config:      config,
 		startTime:   time.Now(),
 		authManager: NewAuthManager(),
+		snapReady:   make(chan struct{}),
 	}
 
 	// Initialize workspace directory
@@ -100,27 +117,42 @@ func NewServer(config Config) *Server {
 		klog.Fatalf("Failed to load public key from environment: %v", err)
 	}
 
-	// API route group (Authenticated)
-	api := engine.Group("/api")
-	api.Use(s.authManager.AuthMiddleware())
-	{
-		api.POST("/execute", s.ExecuteHandler)
-		api.POST("/files", s.UploadFileHandler)
-		api.GET("/files", s.ListFilesHandler)
-		api.GET("/files/*path", s.DownloadFileHandler)
+	// Snapshot build sandboxes must never serve user traffic. Otherwise a write can
+	// race with template creation after /runtime/status reported a clean checkpoint.
+	if !snapstartBuildMode {
+		api := engine.Group("/api")
+		api.Use(s.authManager.AuthMiddleware())
+		{
+			api.POST("/execute", s.ExecuteHandler)
+			api.POST("/files", s.UploadFileHandler)
+			api.GET("/files", s.ListFilesHandler)
+			api.GET("/files/*path", s.DownloadFileHandler)
+		}
 	}
 
 	// Health check (no authentication required)
 	engine.GET("/health", s.HealthCheckHandler)
 
+	// /runtime/status is only registered when running in snapstart build mode.
+	// In cold-start or restore mode this endpoint does not exist (404), which is
+	// the signal to SnapshotController that the runtime doesn't implement the protocol.
+	if snapstartBuildMode {
+		engine.GET("/runtime/status", s.RuntimeStatusHandler)
+	}
+
 	s.engine = engine
 	return s
 }
 
-// Run starts the server
+// Run starts the server. In snapstart build mode it also starts the
+// WarmFork inject-socket listener in the background.
 func (s *Server) Run() error {
 	addr := fmt.Sprintf(":%d", s.config.Port)
 	klog.Infof("PicoD server starting on %s", addr)
+
+	if snapstartBuildMode {
+		go s.runInjectSocket()
+	}
 
 	server := &http.Server{
 		Addr:              addr,
@@ -129,6 +161,37 @@ func (s *Server) Run() error {
 	}
 
 	return server.ListenAndServe()
+}
+
+// RuntimeStatusHandler handles GET /runtime/status.
+// Returns safeToSnapshot=true only after picod has entered the InjectionWaiting state,
+// the workspace is empty (no user files), and no execute tasks are in flight.
+func (s *Server) RuntimeStatusHandler(c *gin.Context) {
+	injectReady := atomic.LoadInt32(&safeToSnapshot) == 1
+	activeTasks := atomic.LoadInt32(&s.activeTaskCount)
+	workspaceEmpty := s.isWorkspaceEmpty()
+	c.JSON(http.StatusOK, gin.H{
+		"checkpoint":      "InterpreterReady",
+		"safeToSnapshot":  injectReady && activeTasks == 0 && workspaceEmpty,
+		"userStateLoaded": !workspaceEmpty || activeTasks > 0,
+		"activeTasks":     int(activeTasks),
+		"details": gin.H{
+			"interpreterState": "idle",
+			"workspaceEmpty":   workspaceEmpty,
+		},
+	})
+}
+
+// isWorkspaceEmpty reports whether the workspace directory contains no files.
+// A non-empty workspace means user state has been written and the instance must
+// not be snapshotted.
+func (s *Server) isWorkspaceEmpty() bool {
+	entries, err := os.ReadDir(s.workspaceDir)
+	if err != nil {
+		klog.V(4).Infof("picod: isWorkspaceEmpty: ReadDir %s: %v", s.workspaceDir, err)
+		return false
+	}
+	return len(entries) == 0
 }
 
 // HealthCheckHandler handles health check requests

@@ -28,6 +28,8 @@ type Interface interface {
 	AgentRuntimes() AgentRuntimeInformer
 	// CodeInterpreters returns a CodeInterpreterInformer.
 	CodeInterpreters() CodeInterpreterInformer
+	// SnapStarts returns a SnapStartInformer.
+	SnapStarts() SnapStartInformer
 }
 
 type version struct {
@@ -49,4 +51,9 @@ func (v *version) AgentRuntimes() AgentRuntimeInformer {
 // CodeInterpreters returns a CodeInterpreterInformer.
 func (v *version) CodeInterpreters() CodeInterpreterInformer {
 	return &codeInterpreterInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// SnapStarts returns a SnapStartInformer.
+func (v *version) SnapStarts() SnapStartInformer {
+	return &snapStartInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

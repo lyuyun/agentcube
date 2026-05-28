@@ -1,0 +1,62 @@
+{{- if .Values.workloadmanager.snapstartWebhook.enabled }}
+{{- if not .Values.workloadmanager.webhook.port }}
+{{- fail "snapstartWebhook.enabled=true requires workloadmanager.webhook.port to be set: Kubernetes admission webhooks require a dedicated TLS endpoint. Set webhook.port (e.g. '8443') and webhook.tls.secretName." }}
+{{- end }}
+# Service to expose the dedicated webhook HTTPS port for SnapStart admission validation.
+# Routes port 443 → workloadmanager.webhook.port (e.g. 8443) on the Workload Manager pods.
+# Set caBundle to the base64-encoded CA certificate that signed the webhook TLS cert.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workloadmanager-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: workloadmanager
+spec:
+  type: ClusterIP
+  ports:
+    - name: https
+      port: 443
+      targetPort: {{ .Values.workloadmanager.webhook.port }}
+      protocol: TCP
+  selector:
+    app: workloadmanager
+---
+# ValidatingWebhookConfiguration for SnapStart uniqueness enforcement.
+# Rejects:
+#  1. runtimeRef.kind=AgentRuntime (Phase 2 only; not yet implemented).
+#  2. A second SnapStart referencing the same CodeInterpreter in a namespace.
+#
+# NOTE: The webhook enforces uniqueness via an in-memory indexer in the Workload Manager.
+# Under a very narrow race window (two concurrent CREATE requests that both arrive before
+# either SnapStart is admitted and indexed), both may pass. The SnapshotController handles
+# this by detecting conflicts in the indexer and setting the duplicate to Failed.
+# A full cluster-level uniqueness guarantee requires a CRD-level CEL validation rule or a
+# separate leader-elected admission controller.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ .Release.Name }}-snapstart-webhook
+  labels:
+    app: workloadmanager
+webhooks:
+  - name: snapstart.runtime.agentcube.volcano.sh
+    clientConfig:
+      service:
+        name: workloadmanager-webhook
+        namespace: {{ .Release.Namespace }}
+        path: /validate/snapstart
+        port: 443
+      caBundle: {{ .Values.workloadmanager.snapstartWebhook.caBundle | quote }}
+    rules:
+      - apiGroups:   ["runtime.agentcube.volcano.sh"]
+        apiVersions: ["v1alpha1"]
+        operations:  ["CREATE", "UPDATE"]
+        resources:   ["snapstarts"]
+        scope:       "Namespaced"
+    sideEffects: None
+    failurePolicy: Fail
+    admissionReviewVersions: ["v1", "v1beta1"]
+    timeoutSeconds: 10
+{{- end }}

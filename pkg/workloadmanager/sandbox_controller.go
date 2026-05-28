@@ -23,10 +23,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	agentcubetypes "github.com/volcano-sh/agentcube/pkg/common/types"
 )
 
 type SandboxReconciler struct {
@@ -52,7 +53,12 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	klog.V(2).Infof("Sandbox %s/%s is ready, notifying waiter", sandbox.Namespace, sandbox.Name)
+	if templateKey := sandbox.Annotations[agentcubetypes.AnnotationRestoredFromSnapshot]; templateKey != "" {
+		klog.V(2).Infof("Sandbox %s/%s restored from snapshot (key=%s), notifying waiter",
+			sandbox.Namespace, sandbox.Name, templateKey)
+	} else {
+		klog.V(2).Infof("Sandbox %s/%s is ready, notifying waiter", sandbox.Namespace, sandbox.Name)
+	}
 
 	r.mu.Lock()
 	resultChan, exists := r.watchers[req.NamespacedName]

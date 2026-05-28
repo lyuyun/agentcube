@@ -53,6 +53,20 @@ func (nopStore) UpdateSessionLastActivity(_ context.Context, _ string, _ time.Ti
 	return nil
 }
 func (nopStore) Close() error { return nil }
+func (nopStore) StoreSnapshot(_ context.Context, _, _ string, _ *types.SnapshotInfo) error {
+	return nil
+}
+func (nopStore) GetSnapshotNodes(_ context.Context, _, _ string) ([]*types.SnapshotInfo, error) {
+	return nil, nil
+}
+func (nopStore) DeleteSnapshot(_ context.Context, _, _, _ string) error  { return nil }
+func (nopStore) DeleteAllSnapshots(_ context.Context, _, _ string) error { return nil }
+func (nopStore) ListSnapshotTemplateIDs(_ context.Context) ([]string, error) {
+	return nil, nil
+}
+func (nopStore) ListAllSnapshotKeys(_ context.Context) ([][2]string, error) {
+	return nil, nil
+}
 
 // gcFakeStore is a controllable store for GC tests.
 type gcFakeStore struct {

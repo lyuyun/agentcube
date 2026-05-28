@@ -20,8 +20,32 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestValidateSnapshotTemplateEnv(t *testing.T) {
+	assertNoError := func(t *testing.T, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	assertNoError(t, validateSnapshotTemplateEnv([]corev1.EnvVar{{Name: "MODE", Value: "batch"}}))
+
+	err := validateSnapshotTemplateEnv([]corev1.EnvVar{{
+		Name: "TOKEN",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "credentials"},
+				Key:                  "token",
+			},
+		},
+	}})
+	if err == nil {
+		t.Fatal("expected valueFrom to be rejected")
+	}
+}
 
 // TestBuildSandboxObject_DoesNotMutateCallerLabels verifies that buildSandboxObject
 // does not write session-specific labels back into the caller's map, which would

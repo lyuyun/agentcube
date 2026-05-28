@@ -52,12 +52,15 @@ func init() {
 
 func main() {
 	var (
-		port             = flag.String("port", "8080", "API server port")
+		port             = flag.String("port", "8080", "API server port (h2c/HTTP or HTTPS when TLS is enabled)")
 		runtimeClassName = flag.String("runtime-class-name", "kuasar-vmm", "RuntimeClassName for sandbox pods")
-		enableTLS        = flag.Bool("enable-tls", false, "Enable TLS (HTTPS)")
-		tlsCert          = flag.String("tls-cert", "", "Path to TLS certificate file")
-		tlsKey           = flag.String("tls-key", "", "Path to TLS key file")
+		enableTLS        = flag.Bool("enable-tls", false, "Enable TLS (HTTPS) for the main API server")
+		tlsCert          = flag.String("tls-cert", "", "Path to TLS certificate file for the main API server")
+		tlsKey           = flag.String("tls-key", "", "Path to TLS key file for the main API server")
 		enableAuth       = flag.Bool("enable-auth", false, "Enable Authentication")
+		webhookPort      = flag.String("webhook-port", "", "Port for the dedicated admission webhook TLS server (e.g. 8443); empty disables the webhook server")
+		webhookTLSCert   = flag.String("webhook-tls-cert", "", "Path to TLS certificate for the webhook server")
+		webhookTLSKey    = flag.String("webhook-tls-key", "", "Path to TLS private key for the webhook server")
 	)
 
 	// Initialize klog flags
@@ -68,8 +71,15 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
+	leaderElectionNamespace := os.Getenv("AGENTCUBE_NAMESPACE")
+	if leaderElectionNamespace == "" {
+		leaderElectionNamespace = "default"
+	}
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme: schemeBuilder,
+		Scheme:                  schemeBuilder,
+		LeaderElection:          true,
+		LeaderElectionID:        "agentcube-workload-manager",
+		LeaderElectionNamespace: leaderElectionNamespace,
 		Metrics: metricsserver.Options{
 			BindAddress: "0", // Disable metrics server
 		},
@@ -103,12 +113,21 @@ func main() {
 		TLSCert:          *tlsCert,
 		TLSKey:           *tlsKey,
 		EnableAuth:       *enableAuth,
+		WebhookPort:      *webhookPort,
+		WebhookTLSCert:   *webhookTLSCert,
+		WebhookTLSKey:    *webhookTLSKey,
 	}
 
 	// Create and initialize API server
 	server, err := workloadmanager.NewServer(config, sandboxReconciler)
 	if err != nil {
 		klog.Fatalf("Failed to create API server: %v", err)
+	}
+
+	// Register SnapshotController with the manager so it runs only on the elected leader,
+	// sharing the single agentcube-workload-manager Lease with the other reconcilers.
+	if err := mgr.Add(server.SnapshotController()); err != nil {
+		klog.Fatalf("Failed to register SnapshotController with manager: %v", err)
 	}
 
 	// Setup signal handling

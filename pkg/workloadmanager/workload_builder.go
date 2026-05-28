@@ -184,7 +184,7 @@ func buildSandboxObject(params *buildSandboxParams) *sandboxv1alpha1.Sandbox {
 			Labels: map[string]string{
 				SessionIdLabelKey:    params.sessionID,
 				WorkloadNameLabelKey: params.workloadName,
-				"managed-by":        "agentcube-workload-manager",
+				"managed-by":         "agentcube-workload-manager",
 			},
 			Annotations: map[string]string{
 				IdleTimeoutAnnotationKey: params.idleTimeout.String(),
@@ -301,8 +301,9 @@ func buildSandboxByAgentRuntime(namespace string, name string, ifm *Informers) (
 	return sandbox, entry, nil
 }
 
-// buildCodeInterpreterEnvVars copies the template env vars and injects the
-// public key when authMode is picod.
+// buildCodeInterpreterEnvVars copies the template env vars and injects the public key when
+// authMode is picod. Callers that build snapshot template sandboxes must call
+// validateSnapshotTemplateEnv first to reject ValueFrom entries.
 func buildCodeInterpreterEnvVars(templateEnv []corev1.EnvVar, authMode runtimev1alpha1.AuthModeType) []corev1.EnvVar {
 	envVars := make([]corev1.EnvVar, len(templateEnv))
 	copy(envVars, templateEnv)
@@ -315,7 +316,20 @@ func buildCodeInterpreterEnvVars(templateEnv []corev1.EnvVar, authMode runtimev1
 	return envVars
 }
 
-func buildSandboxByCodeInterpreter(namespace string, codeInterpreterName string, informer *Informers) (*sandboxv1alpha1.Sandbox, *extensionsv1alpha1.SandboxClaim, *sandboxEntry, error) {
+// validateSnapshotTemplateEnv rejects environment sources that cannot safely be baked into a
+// shared Phase 1 snapshot. SecretKeyRef can leak credentials, while ConfigMapKeyRef and the
+// remaining ValueFrom variants would make restored sessions diverge from cold-start sessions
+// if omitted. Future protocol versions may re-inject these values after restore.
+func validateSnapshotTemplateEnv(templateEnv []corev1.EnvVar) error {
+	for _, env := range templateEnv {
+		if env.ValueFrom != nil {
+			return fmt.Errorf("environment variable %q uses valueFrom, which is not supported by SnapStart Phase 1", env.Name)
+		}
+	}
+	return nil
+}
+
+func buildSandboxByCodeInterpreter(namespace string, codeInterpreterName string, informer *Informers, forceDirectSandbox bool) (*sandboxv1alpha1.Sandbox, *extensionsv1alpha1.SandboxClaim, *sandboxEntry, error) {
 	codeInterpreterKey := namespace + "/" + codeInterpreterName
 	// TODO(hzxuzhonghu): make use of typed informer, so we don't need to do type conversion below
 	runtimeObj, exists, err := informer.CodeInterpreterInformer.GetStore().GetByKey(codeInterpreterKey)
@@ -367,7 +381,7 @@ func buildSandboxByCodeInterpreter(namespace string, codeInterpreterName string,
 		}
 	}
 
-	if codeInterpreterObj.Spec.WarmPoolSize != nil && *codeInterpreterObj.Spec.WarmPoolSize > 0 {
+	if !forceDirectSandbox && codeInterpreterObj.Spec.WarmPoolSize != nil && *codeInterpreterObj.Spec.WarmPoolSize > 0 {
 		sandboxClaim := buildSandboxClaimObject(&buildSandboxClaimParams{
 			namespace:           namespace,
 			name:                sandboxName,

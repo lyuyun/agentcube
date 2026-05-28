@@ -98,6 +98,21 @@ func (f *fakeStoreClient) Close() error {
 	return nil
 }
 
+func (f *fakeStoreClient) StoreSnapshot(_ context.Context, _, _ string, _ *types.SnapshotInfo) error {
+	return nil
+}
+func (f *fakeStoreClient) GetSnapshotNodes(_ context.Context, _, _ string) ([]*types.SnapshotInfo, error) {
+	return nil, nil
+}
+func (f *fakeStoreClient) DeleteSnapshot(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeStoreClient) DeleteAllSnapshots(_ context.Context, _, _ string) error { return nil }
+func (f *fakeStoreClient) ListSnapshotTemplateIDs(_ context.Context) ([]string, error) {
+	return nil, nil
+}
+func (f *fakeStoreClient) ListAllSnapshotKeys(_ context.Context) ([][2]string, error) {
+	return nil, nil
+}
+
 // ---- tests: GetSandboxBySession ----
 
 func TestGetSandboxBySession_Success(t *testing.T) {

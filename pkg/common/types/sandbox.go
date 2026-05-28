@@ -42,6 +42,9 @@ type SandboxInfo struct {
 	// during ListInactiveSandboxes. It is intentionally excluded from JSON serialization.
 	LastActivityAt time.Time `json:"-"`
 	Status         string    `json:"status"`
+	// RestoredFromSnapshot records the Kuasar template key if this sandbox was
+	// restored from a snapshot. Empty for cold-started sandboxes. Used for observability only.
+	RestoredFromSnapshot string `json:"restoredFromSnapshot,omitempty"`
 }
 
 type SandboxEntryPoint struct {

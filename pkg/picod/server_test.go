@@ -402,3 +402,25 @@ func TestServer_MaxBodySizeMiddleware(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(body), "request body too large")
 }
+
+func TestIsWorkspaceEmpty_ReadErrorFailsClosed(t *testing.T) {
+	server := &Server{workspaceDir: filepath.Join(t.TempDir(), "missing")}
+	assert.False(t, server.isWorkspaceEmpty())
+}
+
+func TestNewServer_SnapStartBuildModeDoesNotRegisterBusinessRoutes(t *testing.T) {
+	previous := snapstartBuildMode
+	snapstartBuildMode = true
+	defer func() { snapstartBuildMode = previous }()
+
+	pubKeyPEM := generateTestPublicKeyPEM(t)
+	os.Setenv(PublicKeyEnvVar, pubKeyPEM)
+	defer os.Unsetenv(PublicKeyEnvVar)
+
+	server := NewServer(Config{Port: 8080, Workspace: t.TempDir()})
+	request := httptest.NewRequest(http.MethodPost, "/api/execute", strings.NewReader(`{"command":["true"]}`))
+	response := httptest.NewRecorder()
+	server.engine.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusNotFound, response.Code)
+}

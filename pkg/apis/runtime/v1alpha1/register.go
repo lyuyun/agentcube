@@ -35,6 +35,13 @@ var (
 	AgentRuntimeGroupVersionKind = GroupVersion.WithKind("AgentRuntime")
 )
 
+// SnapStart type metadata.
+var (
+	SnapStartKind             = "SnapStart"
+	SnapStartListKind         = "SnapStartList"
+	SnapStartGroupVersionKind = GroupVersion.WithKind("SnapStart")
+)
+
 // SchemeGroupVersion is group version used to register these objects
 var SchemeGroupVersion = GroupVersion
 

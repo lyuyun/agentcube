@@ -294,16 +294,7 @@ func (r *CodeInterpreterReconciler) convertToPodTemplate(template *runtimev1alph
 		runtimeClassName = nil
 	}
 
-	// Build environment variables - create a copy to avoid mutating the cached object
-	envVars := make([]corev1.EnvVar, len(template.Environment))
-	copy(envVars, template.Environment)
-	// Only inject public key for picod auth mode (default behavior)
-	if ci.Spec.AuthMode != runtimev1alpha1.AuthModeNone {
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "PICOD_AUTH_PUBLIC_KEY",
-			Value: GetCachedPublicKey(),
-		})
-	}
+	envVars := buildCodeInterpreterEnvVars(template.Environment, ci.Spec.AuthMode)
 
 	// Build pod spec
 	podSpec := corev1.PodSpec{

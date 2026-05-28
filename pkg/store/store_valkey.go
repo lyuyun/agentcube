@@ -301,6 +301,118 @@ func (vs *valkeyStore) Close() error {
 	return nil
 }
 
+// StoreSnapshot writes or updates the snapshot record for a specific (runtime, node) pair.
+func (vs *valkeyStore) StoreSnapshot(ctx context.Context, namespace, name string, info *types.SnapshotInfo) error {
+	if info == nil {
+		return errors.New("StoreSnapshot: info is nil")
+	}
+	key := fmt.Sprintf("snapshot:%s:%s", namespace, name)
+	b, err := json.Marshal(info)
+	if err != nil {
+		return fmt.Errorf("StoreSnapshot: marshal info: %w", err)
+	}
+	if err := vs.cli.Do(ctx, vs.cli.B().Hset().Key(key).FieldValue().FieldValue(info.NodeName, string(b)).Build()).Error(); err != nil {
+		return fmt.Errorf("StoreSnapshot: HSET %s %s: %w", key, info.NodeName, err)
+	}
+	return nil
+}
+
+// GetSnapshotNodes returns all per-node snapshot records for the given runtime.
+func (vs *valkeyStore) GetSnapshotNodes(ctx context.Context, namespace, name string) ([]*types.SnapshotInfo, error) {
+	key := fmt.Sprintf("snapshot:%s:%s", namespace, name)
+	result, err := vs.cli.Do(ctx, vs.cli.B().Hgetall().Key(key).Build()).AsStrMap()
+	if err != nil {
+		if valkey.IsValkeyNil(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("GetSnapshotNodes: HGETALL %s: %w", key, err)
+	}
+	infos := make([]*types.SnapshotInfo, 0, len(result))
+	for _, v := range result {
+		var info types.SnapshotInfo
+		if err := json.Unmarshal([]byte(v), &info); err != nil {
+			return nil, fmt.Errorf("GetSnapshotNodes: unmarshal: %w", err)
+		}
+		infos = append(infos, &info)
+	}
+	return infos, nil
+}
+
+// DeleteSnapshot removes the snapshot record for a specific (runtime, node) pair.
+func (vs *valkeyStore) DeleteSnapshot(ctx context.Context, namespace, name, nodeName string) error {
+	key := fmt.Sprintf("snapshot:%s:%s", namespace, name)
+	if err := vs.cli.Do(ctx, vs.cli.B().Hdel().Key(key).Field(nodeName).Build()).Error(); err != nil {
+		return fmt.Errorf("DeleteSnapshot: HDEL %s %s: %w", key, nodeName, err)
+	}
+	return nil
+}
+
+// DeleteAllSnapshots removes all per-node snapshot records for a runtime.
+func (vs *valkeyStore) DeleteAllSnapshots(ctx context.Context, namespace, name string) error {
+	key := fmt.Sprintf("snapshot:%s:%s", namespace, name)
+	if err := vs.cli.Do(ctx, vs.cli.B().Del().Key(key).Build()).Error(); err != nil {
+		return fmt.Errorf("DeleteAllSnapshots: DEL %s: %w", key, err)
+	}
+	return nil
+}
+
+// ListSnapshotTemplateIDs returns all tracked template IDs across all runtimes and nodes.
+func (vs *valkeyStore) ListSnapshotTemplateIDs(ctx context.Context) ([]string, error) {
+	var cursor uint64
+	var ids []string
+	for {
+		scanResult, err := vs.cli.Do(ctx, vs.cli.B().Scan().Cursor(cursor).Match("snapshot:*").Count(100).Build()).AsScanEntry()
+		if err != nil {
+			return nil, fmt.Errorf("ListSnapshotTemplateIDs: SCAN: %w", err)
+		}
+		for _, key := range scanResult.Elements {
+			fields, err := vs.cli.Do(ctx, vs.cli.B().Hgetall().Key(key).Build()).AsStrMap()
+			if err != nil {
+				continue
+			}
+			for _, v := range fields {
+				var info types.SnapshotInfo
+				if err := json.Unmarshal([]byte(v), &info); err != nil {
+					continue
+				}
+				if info.TemplateID != "" {
+					ids = append(ids, info.TemplateID)
+				}
+			}
+		}
+		cursor = scanResult.Cursor
+		if cursor == 0 {
+			break
+		}
+	}
+	return ids, nil
+}
+
+// ListAllSnapshotKeys returns all [namespace, name] pairs that have snapshot data.
+func (vs *valkeyStore) ListAllSnapshotKeys(ctx context.Context) ([][2]string, error) {
+	var cursor uint64
+	var pairs [][2]string
+	for {
+		scanResult, err := vs.cli.Do(ctx, vs.cli.B().Scan().Cursor(cursor).Match("snapshot:*").Count(100).Build()).AsScanEntry()
+		if err != nil {
+			return nil, fmt.Errorf("ListAllSnapshotKeys: SCAN: %w", err)
+		}
+		for _, key := range scanResult.Elements {
+			rest := strings.TrimPrefix(key, "snapshot:")
+			idx := strings.Index(rest, ":")
+			if idx < 0 {
+				continue
+			}
+			pairs = append(pairs, [2]string{rest[:idx], rest[idx+1:]})
+		}
+		cursor = scanResult.Cursor
+		if cursor == 0 {
+			break
+		}
+	}
+	return pairs, nil
+}
+
 // UpdateSessionLastActivity updates the last-activity index for the given session
 func (vs *valkeyStore) UpdateSessionLastActivity(ctx context.Context, sessionID string, at time.Time) error {
 	if sessionID == "" {

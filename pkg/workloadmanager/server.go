@@ -24,8 +24,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
+	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
+	"github.com/volcano-sh/agentcube/pkg/common/types"
 	"github.com/volcano-sh/agentcube/pkg/store"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -33,27 +39,30 @@ import (
 
 // Server is the main structure for workload manager
 type Server struct {
-	config            *Config
-	router            *gin.Engine
-	httpServer        *http.Server
-	k8sClient         *K8sClient
-	sandboxController *SandboxReconciler
-	tokenCache        *TokenCache
-	informers         *Informers
-	storeClient       store.Store
-	wg                sync.WaitGroup
+	config             *Config
+	router             *gin.Engine
+	httpServer         *http.Server
+	webhookServer      *http.Server // dedicated TLS server for /validate/snapstart
+	k8sClient          *K8sClient
+	sandboxController  *SandboxReconciler
+	snapshotController *SnapshotController
+	tokenCache         *TokenCache
+	informers          *Informers
+	storeClient        store.Store
+	wg                 sync.WaitGroup
 }
 
 type Config struct {
-	// Port is the port the API server listens on
+	// Port is the port the main API server listens on.
 	Port string
 	// RuntimeClassName is the RuntimeClassName for sandbox pods
 	RuntimeClassName string
-	// EnableTLS enables HTTPS
+	// EnableTLS enables HTTPS for the main API server. When disabled, the main
+	// API server supports plaintext h2c/HTTP.
 	EnableTLS bool
-	// TLSCert is the path to the TLS certificate file
+	// TLSCert is the path to the TLS certificate file for the main API server.
 	TLSCert string
-	// TLSKey is the path to the TLS private key file
+	// TLSKey is the path to the TLS key file for the main API server.
 	TLSKey string
 	// EnableAuth enable auth by service account
 	EnableAuth bool
@@ -62,6 +71,21 @@ type Config struct {
 	SandboxReadyProbeTimeout time.Duration
 	// SandboxReadyProbeInterval is the retry interval for sandbox entrypoint probes.
 	SandboxReadyProbeInterval time.Duration
+	// WebhookPort is the port for the dedicated admission webhook HTTPS server.
+	// When non-empty, a separate TLS-only server is started for /validate/snapstart
+	// without changing the main API server's TLS mode. Kubernetes admission webhooks
+	// require TLS.
+	WebhookPort string
+	// WebhookTLSCert is the path to the TLS certificate for the webhook server.
+	WebhookTLSCert string
+	// WebhookTLSKey is the path to the TLS private key for the webhook server.
+	WebhookTLSKey string
+}
+
+// SnapshotController returns the server's SnapshotController so callers can register it
+// with a controller-runtime manager via mgr.Add(server.SnapshotController()).
+func (s *Server) SnapshotController() *SnapshotController {
+	return s.snapshotController
 }
 
 // NewServer creates a new API server instance
@@ -89,13 +113,18 @@ func NewServer(config *Config, sandboxController *SandboxReconciler) (*Server, e
 	// Create token cache (cache up to 1000 tokens, 5min TTL)
 	tokenCache := NewTokenCache(1000, 5*time.Minute)
 
+	informers := NewInformers(k8sClient)
+	storeClient := store.Storage()
+	snapshotCtrl := newSnapshotController(k8sClient, storeClient, informers)
+
 	server := &Server{
-		config:            config,
-		k8sClient:         k8sClient,
-		sandboxController: sandboxController,
-		tokenCache:        tokenCache,
-		informers:         NewInformers(k8sClient),
-		storeClient:       store.Storage(),
+		config:             config,
+		k8sClient:          k8sClient,
+		sandboxController:  sandboxController,
+		snapshotController: snapshotCtrl,
+		tokenCache:         tokenCache,
+		informers:          informers,
+		storeClient:        storeClient,
 	}
 
 	// Setup routes
@@ -104,12 +133,15 @@ func NewServer(config *Config, sandboxController *SandboxReconciler) (*Server, e
 	return server, nil
 }
 
-// setupRoutes configures HTTP routes
+// setupRoutes configures HTTP routes on the main h2c server.
+// The /validate/snapstart webhook endpoint lives on a separate TLS server
+// (see startWebhookServer) and is intentionally absent from the main router.
 func (s *Server) setupRoutes() {
 	s.router = gin.New()
 
-	// Health check (no authentication required)
+	// Health check and metrics (no authentication required)
 	s.router.GET("/health", s.handleHealth)
+	s.router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// API v1 routes
 	v1Group := s.router.Group("/v1")
@@ -127,8 +159,105 @@ func (s *Server) setupRoutes() {
 
 // Start starts the API server
 func (s *Server) Start(ctx context.Context) error {
-	// Initialize store with informer before starting server
+	// Wire up event handlers before starting informers.
+	sc := s.snapshotController
 
+	// SnapStart events: add/update trigger reconcile; delete is handled via Finalizer.
+	s.informers.SnapStartInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			if u, ok := obj.(*unstructured.Unstructured); ok {
+				var ss runtimev1alpha1.SnapStart
+				if err := unstructuredToSnapStart(u, &ss); err == nil {
+					sc.indexer.upsert(&ss)
+				}
+				sc.Enqueue(u.GetNamespace(), u.GetName())
+			}
+		},
+		UpdateFunc: func(_, newObj interface{}) {
+			if u, ok := newObj.(*unstructured.Unstructured); ok {
+				var ss runtimev1alpha1.SnapStart
+				if err := unstructuredToSnapStart(u, &ss); err == nil {
+					sc.indexer.upsert(&ss)
+				}
+				sc.Enqueue(u.GetNamespace(), u.GetName())
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			u, ok := obj.(*unstructured.Unstructured)
+			if !ok {
+				if tombstone, ok2 := obj.(cache.DeletedFinalStateUnknown); ok2 {
+					u, ok = tombstone.Obj.(*unstructured.Unstructured)
+				}
+			}
+			if !ok {
+				return
+			}
+			var ss runtimev1alpha1.SnapStart
+			if err := unstructuredToSnapStart(u, &ss); err == nil {
+				sc.indexer.remove(&ss)
+			}
+		},
+	})
+
+	// CodeInterpreter events: spec changes may invalidate existing snapshots;
+	// deletion must mark related SnapStarts as degraded.
+	s.informers.CodeInterpreterInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(_, newObj interface{}) {
+			u, ok := newObj.(*unstructured.Unstructured)
+			if !ok {
+				return
+			}
+			for _, ss := range sc.indexer.getByRuntime(u.GetNamespace(), u.GetName()) {
+				sc.Enqueue(ss.Namespace, ss.Name)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			u, ok := obj.(*unstructured.Unstructured)
+			if !ok {
+				if d, ok2 := obj.(cache.DeletedFinalStateUnknown); ok2 {
+					u, ok = d.Obj.(*unstructured.Unstructured)
+				}
+			}
+			if ok {
+				sc.onRuntimeDeleted(context.Background(), u.GetNamespace(), u.GetName())
+			}
+		},
+	})
+
+	// Node events: track eligibility changes and enqueue affected SnapStarts.
+	// Node availability sync (marking Redis entries Unavailable) is done inside
+	// reconcile() via syncNodeAvailability, not here — event handlers should only
+	// enqueue work to avoid blocking the informer and to get error handling / backoff.
+	s.informers.NodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			node, ok := obj.(*corev1.Node)
+			if !ok {
+				return
+			}
+			// A new eligible+Ready node may need a snapshot built for it.
+			if node.Labels[types.LabelKuasarSnapstart] == "true" && isNodeReady(node) {
+				sc.EnqueueAllReady()
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldNode, ok1 := oldObj.(*corev1.Node)
+			newNode, ok2 := newObj.(*corev1.Node)
+			if !ok1 || !ok2 {
+				return
+			}
+			hadLabel := oldNode.Labels[types.LabelKuasarSnapstart] == "true"
+			hasLabel := newNode.Labels[types.LabelKuasarSnapstart] == "true"
+			// Any readiness or label change may affect snapshot availability or eligibility.
+			if isNodeReady(oldNode) != isNodeReady(newNode) || hadLabel != hasLabel {
+				sc.EnqueueAllReady()
+			}
+		},
+		DeleteFunc: func(_ interface{}) {
+			sc.EnqueueAllReady()
+		},
+	})
+
+	// Initialize store with informer before starting server
 	if err := s.informers.RunAndWaitForCacheSync(ctx); err != nil {
 		return fmt.Errorf("failed to wait for caches to sync: %w", err)
 	}
@@ -163,6 +292,15 @@ func (s *Server) Start(ctx context.Context) error {
 		gc.run(ctx.Done())
 	}()
 
+	// Start the dedicated webhook HTTPS server when configured. This satisfies
+	// Kubernetes' admission webhook TLS requirement without changing the main
+	// API server's existing optional TLS behavior.
+	if s.config.WebhookPort != "" {
+		if err := s.startWebhookServer(ctx); err != nil {
+			return fmt.Errorf("start webhook server: %w", err)
+		}
+	}
+
 	// Start HTTP or HTTPS server
 	if s.config.EnableTLS {
 		if s.config.TLSCert == "" || s.config.TLSKey == "" {
@@ -174,8 +312,47 @@ func (s *Server) Start(ctx context.Context) error {
 	return s.httpServer.ListenAndServe()
 }
 
-// Shutdown performs graceful shutdown of the HTTP server.
+// startWebhookServer starts a dedicated TLS-only HTTP server for /validate/snapstart.
+// It runs in a background goroutine so Start() can proceed to serve the main h2c server.
+func (s *Server) startWebhookServer(ctx context.Context) error {
+	if s.config.WebhookTLSCert == "" || s.config.WebhookTLSKey == "" {
+		return fmt.Errorf("webhook port %s configured but WebhookTLSCert/WebhookTLSKey not set", s.config.WebhookPort)
+	}
+	wh := newAdmissionHandler(s.snapshotController.indexer)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/validate/snapstart", func(w http.ResponseWriter, r *http.Request) {
+		// Bridge net/http → Gin so the admission handler can reuse existing Gin logic.
+		g := gin.New()
+		g.POST("/validate/snapstart", wh.handleValidateSnapStart)
+		g.ServeHTTP(w, r)
+	})
+	s.webhookServer = &http.Server{
+		Addr:        ":" + s.config.WebhookPort,
+		Handler:     mux,
+		ReadTimeout: 15 * time.Second,
+		IdleTimeout: 90 * time.Second,
+	}
+	klog.Infof("Webhook server (TLS) listening on :%s", s.config.WebhookPort)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if err := s.webhookServer.ListenAndServeTLS(s.config.WebhookTLSCert, s.config.WebhookTLSKey); err != nil && err != http.ErrServerClosed {
+			klog.Errorf("Webhook server stopped unexpectedly: %v", err)
+		}
+	}()
+	return nil
+}
+
+// Shutdown performs graceful shutdown of both the main and webhook HTTP servers.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.webhookServer != nil {
+		klog.Info("Shutting down webhook server...")
+		if err := s.webhookServer.Shutdown(ctx); err != nil {
+			klog.Errorf("Webhook server shutdown error: %v", err)
+		} else {
+			klog.Info("Webhook server stopped")
+		}
+	}
 	if s.httpServer != nil {
 		klog.Info("Shutting down HTTP server...")
 		if err := s.httpServer.Shutdown(ctx); err != nil {

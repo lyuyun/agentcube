@@ -51,6 +51,44 @@ workloadmanager:
       cpu: 100m
       memory: 128Mi
   extraEnv: []
+  snapstartWebhook:
+    # enabled controls whether the SnapStart ValidatingWebhookConfiguration is deployed.
+    # Requires webhook.port to be configured; set caBundle to the base64-encoded CA cert.
+    enabled: false
+    caBundle: ""
+  # webhook configures the dedicated TLS-only admission webhook server.
+  # When port is non-empty, a separate HTTPS listener is started for /validate/snapstart
+  # while the main API server stays on plaintext h2c. This avoids forcing all existing
+  # clients to switch from HTTP to HTTPS just because the webhook is enabled.
+  webhook:
+    # port is the container port for the webhook HTTPS server. Empty = webhook server disabled.
+    port: ""
+    # tls.secretName is the Secret containing tls.crt and tls.key for the webhook server.
+    # Required when port is non-empty.
+    tls:
+      secretName: "workloadmanager-webhook-tls"
+
+# AgentD — per-node Kuasar Admin Proxy for SnapStart
+# Deploy as a DaemonSet on nodes that run Kuasar VMM (agentcube.volcano.sh/kuasar-snapstart=true).
+# Required for SnapStart: proxies create-template / delete-template calls from
+# SnapshotController (Workload Manager) to the per-node /run/vmm-sandboxer-admin.sock.
+agentd:
+  enabled: false
+  image:
+    repository: ghcr.io/volcano-sh/agentd
+    pullPolicy: IfNotPresent
+    tag: "latest"
+  # kuasarProxyToken is the shared Bearer token authenticating SnapshotController calls
+  # to the Kuasar Admin Proxy. Required when enabled=true.
+  # Generate with: openssl rand -hex 32
+  kuasarProxyToken: ""
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
 
 # Volcano Agent Scheduler
 volcano:

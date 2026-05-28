@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -53,6 +54,9 @@ type ExecuteResponse struct {
 
 // ExecuteHandler handles command execution requests
 func (s *Server) ExecuteHandler(c *gin.Context) {
+	atomic.AddInt32(&s.activeTaskCount, 1)
+	defer atomic.AddInt32(&s.activeTaskCount, -1)
+
 	var req ExecuteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{

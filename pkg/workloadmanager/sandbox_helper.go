@@ -88,16 +88,17 @@ func buildSandboxInfo(sandbox *sandboxv1alpha1.Sandbox, podIP string, entry *san
 		idleTimeout = DefaultSandboxIdleTimeout
 	}
 	return &types.SandboxInfo{
-		Kind:             entry.Kind,
-		SandboxID:        string(sandbox.GetUID()),
-		Name:             sandbox.GetName(),
-		SandboxNamespace: sandbox.GetNamespace(),
-		EntryPoints:      accesses,
-		SessionID:        entry.SessionID,
-		CreatedAt:        createdAt,
-		ExpiresAt:        expiresAt,
-		Status:           getSandboxStatus(sandbox),
-		IdleTimeout:      metav1.Duration{Duration: idleTimeout},
+		Kind:                 entry.Kind,
+		SandboxID:            string(sandbox.GetUID()),
+		Name:                 sandbox.GetName(),
+		SandboxNamespace:     sandbox.GetNamespace(),
+		EntryPoints:          accesses,
+		SessionID:            entry.SessionID,
+		CreatedAt:            createdAt,
+		ExpiresAt:            expiresAt,
+		Status:               getSandboxStatus(sandbox),
+		IdleTimeout:          metav1.Duration{Duration: idleTimeout},
+		RestoredFromSnapshot: sandbox.Annotations[types.AnnotationRestoredFromSnapshot],
 	}
 }
 

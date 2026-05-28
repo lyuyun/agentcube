@@ -52,7 +52,9 @@ var (
 type Informers struct {
 	AgentRuntimeInformer    cache.SharedIndexInformer
 	CodeInterpreterInformer cache.SharedIndexInformer
+	SnapStartInformer       cache.SharedIndexInformer
 	PodInformer             cache.SharedIndexInformer
+	NodeInformer            cache.SharedIndexInformer
 	informerFactory         informers.SharedInformerFactory
 }
 
@@ -60,7 +62,9 @@ func NewInformers(k8sClient *K8sClient) *Informers {
 	return &Informers{
 		AgentRuntimeInformer:    k8sClient.dynamicInformer.ForResource(AgentRuntimeGVR).Informer(),
 		CodeInterpreterInformer: k8sClient.dynamicInformer.ForResource(CodeInterpreterGVR).Informer(),
+		SnapStartInformer:       k8sClient.dynamicInformer.ForResource(SnapStartGVR).Informer(),
 		PodInformer:             k8sClient.podInformer,
+		NodeInformer:            k8sClient.nodeInformer,
 		informerFactory:         k8sClient.informerFactory,
 	}
 }
@@ -79,6 +83,9 @@ func (ifm *Informers) run(stopCh <-chan struct{}) {
 	ifm.informerFactory.Start(stopCh)
 	go ifm.AgentRuntimeInformer.Run(stopCh)
 	go ifm.CodeInterpreterInformer.Run(stopCh)
+	if ifm.SnapStartInformer != nil {
+		go ifm.SnapStartInformer.Run(stopCh)
+	}
 }
 
 func (ifm *Informers) waitForCacheSync(ctx context.Context) error {
@@ -94,11 +101,27 @@ func (ifm *Informers) waitForCacheSync(ctx context.Context) error {
 		}
 		return fmt.Errorf("timed out waiting for %v caches to sync", CodeInterpreterGVR)
 	}
+	if ifm.SnapStartInformer != nil {
+		if !cache.WaitForCacheSync(ctx.Done(), ifm.SnapStartInformer.HasSynced) {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("timed out waiting for %v caches to sync: %w", SnapStartGVR, err)
+			}
+			return fmt.Errorf("timed out waiting for %v caches to sync", SnapStartGVR)
+		}
+	}
 	if !cache.WaitForCacheSync(ctx.Done(), ifm.PodInformer.HasSynced) {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("timed out waiting for pod informer cache to sync: %w", err)
 		}
 		return fmt.Errorf("timed out waiting for pod informer cache to sync")
+	}
+	if ifm.NodeInformer != nil {
+		if !cache.WaitForCacheSync(ctx.Done(), ifm.NodeInformer.HasSynced) {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("timed out waiting for node informer cache to sync: %w", err)
+			}
+			return fmt.Errorf("timed out waiting for node informer cache to sync")
+		}
 	}
 	return nil
 }
