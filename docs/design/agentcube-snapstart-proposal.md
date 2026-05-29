@@ -66,11 +66,23 @@ ContinuationSnapshot preserves a full process state and network identity. It is 
 
 | Aspect | Assessment |
 |---|---|
-| Suitable workload | Idle sleep/resume for the same user session, preserving variables and runtime state. |
-| Cost | Requires CNI-level network identity control for cross-node restore; implementation complexity is high. |
-| Demand | Most AgentCube use cases need fast new sessions rather than strict stateful resume. |
+| Suitable workload | Suspend/resume for the same user and same long-running agent session, preserving variables, runtime state, workspace state, and in-flight task context. |
+| Saved cost | Releases idle sandbox memory while the agent is blocked on LLM generation, external tools, or user confirmation. |
+| Cost | Requires per-session artifact ownership, CNI-level network identity control for cross-node restore, strong access control, and strict lifetime management; implementation complexity is high. |
+| Sharing model | One snapshot belongs to one session only. It must never be inserted into the shared SnapStart template pool. |
 
-Conclusion: ContinuationSnapshot is out of scope for this design. A future session-resume feature can be evaluated separately.
+This is valuable for agent workloads whose execution is intermittent inside a single long session. For example, an agent may execute step A inside a sandbox, call an LLM, then wait several seconds for token generation or a tool-planning response. It may also pause for minutes while waiting for the user to approve a destructive action, provide credentials, choose an option, or confirm that the next step should proceed. During those gaps the sandbox may be completely idle from a CPU perspective, but it still holds VM memory, browser memory, Python heap, workspace caches, and agent context. A continuation snapshot can suspend that sandbox into a session-private artifact, destroy the running sandbox to reclaim memory, and later restore the same session when the LLM returns or the user speaks again.
+
+ContinuationSnapshot therefore optimizes a different axis from SnapStart:
+
+| Mechanism | Primary goal | State allowed in snapshot | Reuse scope |
+|---|---|---|---|
+| WarmForkSnapshot / SnapStart | Fast startup for many new sessions | Clean runtime state before user input | Shared across many sessions |
+| ContinuationSnapshot | Reduce idle memory cost for one existing session | User/session state, agent memory, workspace, and task context | Same session only |
+
+The contamination rules are intentionally opposite. SnapStart snapshots must reject user state because they are shared templates. Continuation snapshots exist precisely to preserve user state, so they require a different security model: the artifact must be bound to `sessionID`, user, tenant, runtimeRef, and restore generation; restore must verify ownership before use; artifacts should be encrypted or stored in a trusted node-local / distributed backend; and deletion must follow session TTL, max continuation age, and explicit user/session cleanup.
+
+ContinuationSnapshot is out of scope for the current SnapStart design because this document focuses on reusable startup templates. It should be evaluated as a separate future **session suspend/resume** feature. The two features can share lower-level Kuasar restore plumbing, but they should not share CRD status, Redis keys, template keys, warm pool accounting, or restore selection logic without an explicit abstraction boundary.
 
 ### 2.4 Memory Restore Mode
 
@@ -86,11 +98,11 @@ Kuasar supports restore modes such as `copy`, `ondemand`, `filebackend`, and `ex
 |---|---|---|
 | Primary snapshot type | WarmForkSnapshot | It removes runtime initialization latency, the real bottleneck. |
 | Phase 1 bootstrap type | EnvironmentSnapshot first, then WarmForkSnapshot | Validates the restore path before picod changes are complete. |
-| ContinuationSnapshot | Out of scope | High complexity and no immediate requirement. |
+| ContinuationSnapshot | Out of scope for SnapStart; future session suspend/resume feature | Valuable for reclaiming idle memory in long agent sessions, but it preserves user/session state and therefore needs a separate ownership, security, lifecycle, and restore model. |
 | Memory restore mode | Not exposed | Managed globally by Kuasar infrastructure. |
 | API shape | Independent `SnapStart` CRD | Snapshot lifecycle, finalizers, per-node metadata, build jobs, and GC deserve a separate resource. |
 | Snapshot construction | Job-like controller semantics | Snapshot build is asynchronous, retryable, observable, and stateful. |
-| WarmPool interaction | Mutually exclusive in Phase 1 | Combining SandboxWarmPool and SnapStart requires separate operational semantics. |
+| WarmPool interaction | Orthogonal layers | SandboxWarmPool is an AgentCube allocation policy. SnapStart is a Kuasar sandbox-start optimization. A claimed warm Pod is already running and is never restored again; SnapStart may accelerate newly created refill sandboxes. |
 | Snapshot storage | Artifact-aware model; node-local backend in Phase 1 | Phase 1 stores Kuasar templates on node-local disk, but API/status and metadata model the result as a snapshot artifact plus restore placement so future Kuasar cross-node distribution can fit without changing the user-facing SnapStart API. |
 | Lifecycle cleanup | Finalizer + two-phase metadata + annotation-triggered rebuild | Covers deletion, orphan cleanup, and manual rebuild. |
 
@@ -100,14 +112,14 @@ Industry systems differ because their deployment boundaries differ:
 
 | Product | Mechanism | Independent runtime definition | Snapshot optional | Independent snapshot resource |
 |---|---|---|---|---|
-| AWS Lambda SnapStart | VMM memory snapshot | No; function version is the deployment unit | Yes | No |
-| E2B | VMM memory snapshot | No; template is the only sandbox entrypoint | No | No |
-| Daytona | Snapshot | No independent cold runtime path | No | Yes, but it is also the runtime entrypoint |
-| Modal | CRIU memory snapshot | No; function is the deployment unit | Yes | No |
-| GKE AgentSandbox | Kubernetes Pod warm pool | Yes, via SandboxTemplate | N/A | N/A |
+| [AWS Lambda SnapStart](https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html) | Firecracker microVM memory/disk snapshot for published function versions | No; function version is the deployment unit | Yes | No; the snapshot is managed behind the function version |
+| [E2B Templates / Sandbox Snapshots](https://e2b.dev/docs/sandbox/snapshots) | Template build snapshots plus running-sandbox filesystem/memory snapshots | Yes; templates define reusable sandbox environments | Yes; a sandbox can start from a template or from a snapshot ID | Yes; sandbox snapshots have snapshot IDs and list/delete APIs |
+| [Daytona Snapshots](https://www.daytona.io/docs/en/snapshots/) | Docker/OCI image-backed sandbox snapshots/templates | No independent cold runtime path; snapshots are the sandbox template entrypoint | No; sandboxes use a default or custom snapshot | Yes |
+| [Modal Functions Memory Snapshots](https://modal.com/docs/guide/memory-snapshots) | Container memory snapshot for deployed Functions | No; function is the deployment unit | Yes | No for Function Memory Snapshots |
+| [GKE Agent Sandbox](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/agent-sandbox) | Kubernetes Pod warm pool | Yes, via SandboxTemplate | N/A | N/A |
 | AgentCube | Kuasar WarmForkSnapshot | Yes, CodeInterpreter / AgentRuntime can cold start | Yes | Yes |
 
-AgentCube differs from Lambda, Modal, E2B, and Daytona because CodeInterpreter / AgentRuntime remain valid runtime definitions without SnapStart. SnapStart is an optional optimization layer on top of an existing runtime. This favors a separate Kubernetes resource.
+AgentCube differs from Lambda SnapStart and Modal Functions Memory Snapshots because CodeInterpreter / AgentRuntime remain valid runtime definitions without SnapStart. It also differs from Daytona's snapshot-first sandbox model because SnapStart is optional rather than the sandbox template entrypoint. E2B already exposes both templates and independent sandbox snapshots, but its API boundary is sandbox/template centric; AgentCube keeps Kubernetes runtime resources as the primary workload definitions and layers SnapStart on top. This favors a separate Kubernetes resource.
 
 Embedding snapshot fields into CodeInterpreter would mix workload definition with snapshot lifecycle. A snapshot has its own state machine, finalizer, build job, per-node artifacts, invalidation behavior, and orphan cleanup. A dedicated `SnapStart` CRD keeps responsibilities separate.
 
@@ -176,15 +188,44 @@ The controller must expose build phase, active mode, invalidation reason, per-no
 
 ### 3.5 SnapStart and WarmPool
 
-Kubernetes WarmPool and SnapStart solve different problems:
+Kubernetes SandboxWarmPool and SnapStart solve different problems at different layers:
 
-| Mechanism | What is pre-created | Main cost | Main benefit |
-|---|---|---|---|
-| SandboxWarmPool | Scheduled Pod / sandbox slot | Full Pod resources per warm slot | Avoids scheduling/image/container startup delay |
-| SnapStart | Runtime memory template | Snapshot storage and restore cost | Avoids runtime initialization delay |
-| SnapStart WarmPool | Restored runtime instances | CoW memory and idle CPU | Avoids restore latency too |
+| Mechanism | Layer | What is pre-created | Main cost | Main benefit |
+|---|---|---|---|---|
+| SandboxWarmPool | AgentCube | Scheduled Pod / sandbox slot | Full Pod resources per warm slot | Avoids session-time scheduling and sandbox startup delay |
+| SnapStart | Kuasar | Runtime memory template | Snapshot storage and restore cost | Avoids runtime initialization delay when Kuasar starts a new sandbox |
 
-In Phase 1, SnapStart and `spec.warmPoolSize` are mutually exclusive. A later phase can define a combined model with clear metrics and cost attribution.
+SnapStart and `CodeInterpreter.spec.warmPoolSize` are orthogonal and may be enabled together. There is no AgentCube-level ordering such as `SnapStart -> SandboxWarmPool -> cold start`. The ownership boundary is:
+
+| Decision | Owner | Rule |
+|---|---|---|
+| Reuse an existing warm Pod | AgentCube SandboxWarmPool controller | If a ready warm slot exists, bind the `SandboxClaim` to that already-running Sandbox. |
+| Create a new Sandbox | AgentCube | A direct non-WarmPool request creates a normal Sandbox. SandboxWarmPool keeps the existing claim path and creates normal refill Sandboxes in the background when ready capacity is below target. |
+| Restore or cold-start a newly created Sandbox | Kuasar | Kuasar uses a compatible SnapStart template when available; otherwise it cold-starts the same Sandbox. |
+
+A Sandbox obtained from SandboxWarmPool must not be restored again. It is already running before the user claim is bound, so there is no VM startup stage at which restore can occur. This is enforced by the following invariants:
+
+1. `SandboxClaim` allocation does not append snapshot restore annotations.
+2. A claimed warm Sandbox does not execute a second Kuasar start or restore transaction.
+3. SnapStart intent applies only when Kuasar starts a newly created Sandbox.
+4. SandboxWarmPool refill Sandboxes may use SnapStart during their initial Kuasar startup, then enter the pool as ordinary ready warm slots.
+
+This allows the mechanisms to compose without duplicate startup work:
+
+```text
+SandboxWarmPool hit
+  -> AgentCube binds an already-ready Sandbox
+  -> no Kuasar restore occurs
+
+Direct Sandbox create or SandboxWarmPool background refill
+  -> AgentCube creates a new Sandbox
+  -> Kuasar restores from a compatible SnapStart template when possible
+  -> otherwise Kuasar cold-starts the Sandbox
+```
+
+This design does not introduce a separate Kuasar-layer SnapStart WarmPool. SandboxWarmPool already owns pre-created Sandbox capacity, and its background refill can use SnapStart to reduce startup cost. A second pool would duplicate capacity management and require separate precedence, quota, reclamation, observability, and failure-recovery semantics without sufficient value.
+
+The user-facing API does not expose a node-local Kuasar template ID. A platform administrator enables SnapStart by creating a `SnapStart` object whose `spec.runtimeRef` points to a runtime. When AgentCube creates a new Sandbox for that runtime, it automatically propagates a logical SnapStart intent, such as `agentcube.volcano.sh/snapstart-ref: <namespace>/<snapstart-name>`. Kuasar resolves that logical reference to a compatible template available on the actual startup node. A Kuasar template ID is node-local implementation metadata and must never be supplied by an end user.
 
 ### 3.6 High-Level Architecture
 
@@ -197,8 +238,8 @@ graph TB
         CI["CodeInterpreter CR\n(pure workload definition, no snapshot fields)"]
         SS["SnapStart CR *\nruntimeRef -> CodeInterpreter\ncheckpoint / invalidation"]
         SC["SnapshotController *\nsnapshot lifecycle management"]
-        WM["Workload Manager\ntryAnnotateWithSnapshot()"]
-        SR["SandboxReconciler *\ndetects snapshot-template-id annotation\nbranches restore / cold-start path"]
+        WM["Workload Manager\nallocate SandboxClaim or Sandbox"]
+        SR["SandboxReconciler *\npropagates logical SnapStart intent"]
         Router["AgentCube Router"]
     end
 
@@ -221,7 +262,7 @@ graph TB
     SC -->|"2. read CodeInterpreter (via runtimeRef)"| CI
     SC -->|"3. create snapshot build sandbox"| TmplSbx
     TmplSbx -->|"4. /runtime/status\ncheckpoint=InterpreterReady\nsafeToSnapshot=true"| SC
-    SC -->|"5. template-create\nsnapshot_type=warm_fork"| Agentd
+    SC -->|"5. create-template\nsnapshot_type=warm_fork"| Agentd
     Agentd -->|"Kuasar Admin API"| Kuasar
     Kuasar --> SnapFile
     SC -->|"6. HSET snapshot metadata (per node)\nactiveMode=Snapshot"| Redis
@@ -231,21 +272,19 @@ graph TB
     %% Data plane: fast session creation path
     User -->|"HTTP request\nwithout x-agentcube-session-id"| Router
     Router -->|"9. CreateSandbox"| WM
-    WM -->|"10. query snapshot metadata"| Redis
-    WM -->|"11. create Sandbox CR\nsnapshot-template-id annotation\n+ node affinity"| SR
-    SR -->|"12. detect annotation\nWarmForkSnapshot restore"| Kuasar
-    Kuasar -->|"13. CoW restore + hot-plug network ns"| SessionSbx
-    WM -->|"14. write session information"| Redis
-    Router -->|"15. forward request"| SessionSbx
+    WM -->|"10. create Sandbox CR\nlogical snapstart-ref intent"| SR
+    SR -->|"11. propagate logical intent"| Kuasar
+    Kuasar -->|"12. resolve compatible local template\nCoW restore + hot-plug network ns"| SessionSbx
+    WM -->|"13. write session information"| Redis
+    Router -->|"14. forward request"| SessionSbx
 
     %% Fallback path
-    WM -.->|"snapshot unavailable\ncreate Sandbox CR without annotation"| SR
-    SR -.->|"cold-start path (existing logic)"| Kuasar
+    Kuasar -.->|"no compatible local template\ncold-start same Sandbox"| SessionSbx
 ```
 
-Legend: `*` marks components or capabilities added or extended by this design, including SnapshotController, SandboxReconciler, and the agentd Kuasar Admin Proxy. Steps 1-8 are the control-plane snapshot build flow, which has one-shot job semantics. Steps 9-15 are the data-plane fast session creation path. Dashed edges are the cold-start fallback path. Redis writes use Hash format, such as `HSET snapshot:{ns}:{name} {node_name} {...}`, so per-node restore placements can coexist for one snapshot artifact.
+Legend: `*` marks components or capabilities added or extended by this design, including SnapshotController, SandboxReconciler, and the agentd Kuasar Admin Proxy. Steps 1-8 are the control-plane snapshot build flow, which has one-shot job semantics. Steps 9-14 are the data-plane fast session creation path. Dashed edges are the cold-start fallback path. Redis writes use Hash format, such as `HSET snapshot:{ns}:{name} {node_name} {...}`, so per-node restore placements can coexist for one snapshot artifact.
 
-Key design characteristics: CodeInterpreter remains a pure workload definition, while snapshot acceleration is layered through an independent SnapStart object. Both the restore path and the cold-start path go through Sandbox CR -> SandboxReconciler -> Kuasar. The only differences are whether the Sandbox CR carries the `snapshot-template-id` annotation and whether node affinity is constrained by the selected placement. The agentd Admin Proxy participates only in control-plane template operations such as `template-create` and `delete-template`; it is not on the session creation data path.
+Key design characteristics: CodeInterpreter remains a pure workload definition, while snapshot acceleration is layered through an independent SnapStart object. Both the restore path and the cold-start path go through Sandbox CR -> SandboxReconciler -> Kuasar. AgentCube automatically propagates only a logical SnapStart intent for a newly created Sandbox. Kuasar resolves the node-local template ID internally after placement and cold-starts the same Sandbox when no compatible template exists. The agentd Admin Proxy participates only in control-plane template operations such as `create-template` and `delete-template`; it is not on the session creation data path.
 
 Main components:
 
@@ -253,8 +292,9 @@ Main components:
 |---|---|
 | `SnapStart` CRD | User-facing snapshot acceleration configuration and status. |
 | SnapshotController | Builds templates, tracks status, handles invalidation and GC. |
-| Workload Manager | Creates sessions and tries to select a snapshot template before cold start. |
-| SandboxReconciler | Restores a sandbox when snapshot annotations are present. |
+| Workload Manager | Creates sessions and preserves the existing SandboxWarmPool allocation decision. |
+| SandboxReconciler | Propagates the automatically generated logical SnapStart intent for a newly created Sandbox. |
+| Kuasar | Resolves a compatible node-local template ID during Sandbox startup, restores when possible, and otherwise cold-starts the same Sandbox. |
 | agentd Kuasar proxy | Provides node-local access to Kuasar Admin API through a controlled HTTP proxy. |
 | Store / Redis | Stores snapshot artifact metadata, local template IDs, and per-node restore availability. |
 | Runtime process | Implements ready-waiting status and inject socket protocol. |
@@ -308,16 +348,13 @@ spec:
   checkpoint: InterpreterReady
   artifact:
     distribution: NodeLocal
-  placement:
-    strategy: MinimumReady
-    minReadyNodes: 1
   invalidation:
     onImageDigestChange: true
     onArgsChange: true
     maxAge: 24h
 ```
 
-The controller builds templates according to the active placement policy and updates status. In Phase 1 the artifact is backed by node-local Kuasar templates, so per-node `localTemplateID` values stay in Redis/ValKey while the CRD status exposes the global artifact identity and placement summary. A typical status includes:
+The controller builds templates on every eligible node and updates status. A Phase 1 eligible node is Ready, has `agentcube.volcano.sh/kuasar-snapstart=true`, and satisfies the referenced runtime's scheduling constraints. The artifact is backed by node-local Kuasar templates, so per-node `localTemplateID` values stay in Redis/ValKey while CRD status exposes aggregate counts. A typical status includes:
 
 ```yaml
 status:
@@ -325,14 +362,12 @@ status:
   message: "Snapshot ready. New sessions will use fast startup (~0.5-2s)."
   snapshot:
     phase: Ready
-    templateKey: "fork:sha256-a1b2c3:InterpreterReady:args-7d9f2e"
     artifact:
-      id: "snap-python-8f3a1b9c"
-      storageClass: NodeLocal
-      digest: "sha256:..."
-    placement:
-      readyNodes: 2
-      eligibleNodes: 5
+      distribution: NodeLocal
+    readyNodes: 2
+    eligibleNodes: 5
+    failedNodes: 0
+    unavailableNodes: 0
     readyAt: "2026-05-25T10:00:00Z"
 ```
 
@@ -352,14 +387,14 @@ Internally, Workload Manager:
 
 1. Authenticates and authorizes the request exactly as before.
 2. Resolves the runtime.
-3. Finds a ready SnapStart template for that runtime.
-4. Creates a Sandbox with restore annotations and node affinity.
-5. SandboxReconciler drives Kuasar restore.
-6. SandboxReconciler creates the restore Pod with Kuasar protocol annotations before Pod creation.
+3. Preserves the existing AgentCube allocation policy: create a `SandboxClaim` when SandboxWarmPool is enabled, otherwise create a direct Sandbox.
+4. When creating a new Sandbox, automatically adds the logical SnapStart intent derived from the runtime's associated `SnapStart` object.
+5. SandboxReconciler propagates that logical intent before Pod creation.
+6. Kuasar resolves a compatible template ID available on the actual startup node and restores when possible.
 7. Kuasar sandboxer sends PREPARE, the runtime replies READY, Kuasar sends COMMIT, and the runtime sends STARTED.
 8. Session becomes ready.
 
-If no valid template is available, the request falls back to cold start.
+If Kuasar cannot resolve a valid local template, it cold-starts the same newly created Sandbox. If AgentCube allocates an already-running SandboxWarmPool slot, no Kuasar startup or restore transaction occurs for the claim.
 
 ### 4.3 Flow C: Automatic Rebuild After Invalidation
 
@@ -373,6 +408,8 @@ Ready(old key) -> Invalidated -> Creating(new key) -> Ready(new key)
 
 During rebuild, existing sessions continue to run. New sessions do not reuse the old template; `activeMode=Cold`, so all new sessions fall back to cold start until the new snapshot is Ready.
 
+Restore selection must also be guarded against controller convergence windows. A runtime spec update immediately makes old placements ineligible for new sessions, even if SnapshotController has not yet reconciled and removed their Redis metadata. The Kuasar-facing restore selector must verify the logical intent and placement version against the current published runtime inputs before restoring a Sandbox.
+
 ### 4.4 Flow D: Complete Template Lifecycle
 
 The lifecycle must cover:
@@ -382,7 +419,7 @@ The lifecycle must cover:
 | SnapStart deletion | Finalizer cleans Kuasar template files and Redis metadata before object deletion. |
 | Referenced runtime deletion | SnapshotController detects it, cleans templates, and marks SnapStart failed. |
 | Controller crash during build | Two-phase metadata allows orphan detection and cleanup. |
-| Manual rebuild | `agentcube.volcano.sh/force-rebuild: "true"` annotation triggers one rebuild; the annotation is removed only after rebuild succeeds, so failures keep retrying. |
+| Manual rebuild | `agentcube.volcano.sh/force-rebuild: "true"` annotation triggers a bounded rebuild cycle. The annotation is removed only after rebuild succeeds. If all three attempts fail, it remains for diagnosis; set it to `"false"` and then back to `"true"` to explicitly start a new cycle after remediation. |
 | Node NotReady | Mark node template unavailable after grace period. |
 | Node recovery | Verify template existence with `list-templates`; rebuild if missing. |
 | Node deletion | Remove node metadata and rebuild on remaining eligible nodes. |
@@ -399,8 +436,6 @@ type SnapStartSpec struct {
     Checkpoint string `json:"checkpoint"`
     Invalidation *SnapStartInvalidation `json:"invalidation,omitempty"`
     Artifact *SnapStartArtifactSpec `json:"artifact,omitempty"`
-    Placement *SnapStartPlacementSpec `json:"placement,omitempty"`
-    SnapStartWarmPool *SnapStartWarmPoolSpec `json:"snapStartWarmPool,omitempty"`
 }
 
 type RuntimeReference struct {
@@ -440,31 +475,6 @@ type SnapStartArtifactSpec struct {
     Distribution SnapshotArtifactDistribution `json:"distribution,omitempty"`
 }
 
-type SnapshotPlacementStrategy string
-
-const (
-    SnapshotPlacementStrategyMinimumReady SnapshotPlacementStrategy = "MinimumReady"
-    SnapshotPlacementStrategyAllEligible  SnapshotPlacementStrategy = "AllEligible"
-)
-
-type SnapStartPlacementSpec struct {
-    // Strategy controls how aggressively SnapshotController materializes restore placements.
-    // Defaults to MinimumReady.
-    Strategy SnapshotPlacementStrategy `json:"strategy,omitempty"`
-    // MinReadyNodes is used by MinimumReady. Defaults to 1.
-    MinReadyNodes int32 `json:"minReadyNodes,omitempty"`
-    // MaxReadyNodes optionally caps eager materialization. Zero means no explicit cap.
-    MaxReadyNodes int32 `json:"maxReadyNodes,omitempty"`
-}
-
-type SnapStartWarmPoolSpec struct {
-    // Enabled activates the Kuasar VMM-layer pre-restored sandbox pool.
-    Enabled bool `json:"enabled"`
-    // Size is the target number of pre-restored ready sandboxes.
-    // +kubebuilder:validation:Minimum=1
-    // +kubebuilder:validation:Maximum=20
-    Size int32 `json:"size,omitempty"`
-}
 ```
 
 Key fields:
@@ -475,10 +485,8 @@ Key fields:
 | `checkpoint` | Runtime checkpoint, such as `InterpreterReady` or `BrowserReady`. |
 | `invalidation` | Controls rebuild behavior when runtime inputs change. |
 | `artifact` | Controls artifact storage/distribution intent. Phase 1 supports only `NodeLocal`; `LazyRemote` and `PreDistribute` are future Kuasar distributed artifact modes. |
-| `placement` | Controls how many restore placements are materialized eagerly. Phase 1 defaults to `MinimumReady` so a snapshot can become useful before every eligible node has a local template. |
-| `snapStartWarmPool` | Optional Kuasar VMM-layer pre-restored sandbox pool. It is distinct from CodeInterpreter `spec.warmPoolSize`. |
 
-`artifact` and `placement` intentionally describe different layers. `artifact.distribution` answers how the snapshot product is stored and distributed. `placement.strategy` answers which nodes should be made restorable and how aggressively. For example, future `artifact.distribution=LazyRemote` with `placement.strategy=MinimumReady` means the global artifact may exist remotely, but only a minimum number of nodes are eagerly materialized; other nodes can materialize lazily if selected.
+Phase 1 deliberately has no `spec.placement` field. SnapshotController materializes a node-local template on every eligible node. Operators control the coverage set by managing the `agentcube.volcano.sh/kuasar-snapstart=true` node label and runtime scheduling constraints. Future distributed-artifact phases may introduce an explicit placement policy when region, zone, capacity, and lazy materialization requirements are concrete.
 
 ### 5.2 SnapStart Status
 
@@ -509,32 +517,22 @@ const (
 
 type SnapshotStatus struct {
     Phase SnapshotPhase `json:"phase"`
-    TemplateKey string `json:"templateKey,omitempty"`
     Artifact *SnapshotArtifactStatus `json:"artifact,omitempty"`
-    Placement *SnapshotPlacementStatus `json:"placement,omitempty"`
+    EligibleNodes int32 `json:"eligibleNodes,omitempty"`
+    ReadyNodes int32 `json:"readyNodes,omitempty"`
+    FailedNodes int32 `json:"failedNodes,omitempty"`
+    UnavailableNodes int32 `json:"unavailableNodes,omitempty"`
     ReadyAt *metav1.Time `json:"readyAt,omitempty"`
     FailedReason string `json:"failedReason,omitempty"`
     RestoreFailureCount int32 `json:"restoreFailureCount,omitempty"`
+    BuildFailureCount int32 `json:"buildFailureCount,omitempty"`
+    NextBuildRetryAt *metav1.Time `json:"nextBuildRetryAt,omitempty"`
 }
-
-type SnapshotArtifactStorageClass string
-
-const (
-    SnapshotArtifactStorageClassNodeLocal   SnapshotArtifactStorageClass = "NodeLocal"
-    SnapshotArtifactStorageClassDistributed SnapshotArtifactStorageClass = "Distributed"
-)
 
 type SnapshotArtifactStatus struct {
-    ID string `json:"id,omitempty"`
-    StorageClass SnapshotArtifactStorageClass `json:"storageClass,omitempty"`
-    Digest string `json:"digest,omitempty"`
-    URI string `json:"uri,omitempty"`
+    Distribution SnapshotArtifactDistribution `json:"distribution"`
 }
 
-type SnapshotPlacementStatus struct {
-    ReadyNodes int32 `json:"readyNodes,omitempty"`
-    EligibleNodes int32 `json:"eligibleNodes,omitempty"`
-}
 ```
 
 Important status concepts:
@@ -542,11 +540,11 @@ Important status concepts:
 | Field | Meaning |
 |---|---|
 | `activeMode` | `Cold` or `Snapshot`. |
-| `snapshot.phase` | CRD-level aggregate phase: `Pending`, `Creating`, `Ready`, `Invalidated`, or `Failed`. Per-node Redis phases include `Building`, `Ready`, `Failed`, `Unavailable`, and `Invalidated`. |
-| `snapshot.templateKey` | Deterministic key for the build inputs. |
-| `snapshot.artifact` | Global artifact identity and storage class. Phase 1 uses `storageClass=NodeLocal`; future Kuasar versions can use `Distributed` with a URI/digest. |
-| `snapshot.placement` | User-visible placement summary, such as ready nodes versus eligible nodes. Per-node template IDs remain in Redis/ValKey. |
+| `snapshot.phase` | CRD-level aggregate phase: `Pending`, `Creating`, `Ready`, `Invalidated`, or `Failed`. Placement metadata reuses `SnapshotPhase` for coarse state and uses `cacheState` for placement-specific details such as `Building`, `Pulling`, or `LocalReady`. |
+| `snapshot.artifact` | Effective artifact distribution mode. Phase 1 uses `NodeLocal`. |
+| `snapshot.eligibleNodes`, `readyNodes`, `failedNodes`, `unavailableNodes` | Aggregate node counts. Per-node template IDs and version metadata remain in Redis/ValKey. |
 | `snapshot.restoreFailureCount` | Consecutive restore failures. SnapshotController marks the snapshot Invalidated when this reaches 3, and resets it after a successful rebuild. |
+| `snapshot.buildFailureCount`, `nextBuildRetryAt` | Persisted bounded-retry state for transient build failures. Automatic retries stop after three failed attempts. |
 | `conditions` | User-facing readiness and degraded reasons. |
 | `message` | Human-readable current state and next steps. |
 
@@ -612,6 +610,10 @@ Fields intentionally excluded from `spec_hash`: labels, annotations, `imagePullS
 
 For tagged images, the build sandbox should use `imagePullPolicy: Always` so the controller can observe the resolved image digest. For digest-pinned images, `IfNotPresent` is allowed.
 
+`templateKey` is also the restore-time version gate. SnapshotController writes the key and its build inputs into placement metadata and publishes the current logical artifact version through the Kuasar-facing template-discovery contract. Because the final key includes the resolved image digest that is only known after a build Pod runs, the restore selector validates the stored full `templateKey` and the pre-resolved inputs (`runtimeSpecHash`, checkpoint, protocol version, and runtime generation). A placement whose version does not match the currently published logical artifact version is unavailable, even if its placement phase is still `Ready`.
+
+This synchronous restore-time check is required because SnapshotController is eventually consistent. Runtime updates, webhook admission, informer delivery, and Redis cleanup can race with session creation. The data-plane restore selector must therefore reject stale placements independently of the asynchronous invalidation/rebuild loop.
+
 ---
 
 ## 6. Internal Implementation
@@ -641,7 +643,7 @@ Reconcile SnapStart
   -> read resolved image digest from Pod status
   -> compute final template key
   -> wait for runtime checkpoint
-  -> call Kuasar template-create
+  -> call Kuasar create-template
   -> write Ready metadata
   -> update SnapStart status
 ```
@@ -664,12 +666,12 @@ Build and restore placement semantics:
 |---|---|
 | Eligible nodes | Nodes must be Ready, advertise Kuasar SnapStart capability, match the runtime class, and satisfy scheduling constraints. |
 | Artifact distribution | `spec.artifact.distribution` declares the intended storage/distribution mode. Phase 1 only supports `NodeLocal`; future modes include `LazyRemote` and `PreDistribute`. |
-| Snapshot artifact | The logical result is a snapshot artifact identified in status by `artifact.id`, `templateKey`, and optional digest/URI. |
-| Phase 1 backend | `artifact.storageClass=NodeLocal`; each selected node owns a Kuasar local template for the same logical artifact. |
+| Snapshot artifact | The logical result is one snapshot artifact. Phase 1 status exposes its aggregate distribution mode, while Redis/ValKey placement metadata stores `artifactId`, `templateKey`, and optional digest/URI fields. Future distributed modes may promote globally meaningful artifact identity into CRD status. |
+| Phase 1 backend | `artifact.distribution=NodeLocal`; each eligible node owns a Kuasar local template for the same logical artifact. |
 | NodeLocal build node rule | In `NodeLocal`, the build node is also the restore node, so it must be in the runtime eligible node set. SnapshotController must reject or invalidate any local placement whose node no longer satisfies runtime scheduling constraints. |
 | Distributed build node rule | In future `Distributed` modes, the artifact build node may come from a separate build pool and may be outside the runtime eligible node set. It must not be published as a restore placement unless it also satisfies runtime scheduling constraints. |
-| Build placement | SnapshotController chooses where to materialize local templates. Phase 1 may use all eligible nodes or a smaller policy such as minimum ready nodes; the API/status must not assume all nodes are always built eagerly. |
-| Restore placement | Workload Manager selects a Ready placement entry and binds the Sandbox to the node that can restore it. Phase 1 selects only entries with `cacheState=LocalReady`; future distributed artifacts may allow lazy pull before restore. |
+| Build placement | SnapshotController materializes local templates on all eligible nodes in Phase 1. Operators control the coverage set through node labels and runtime scheduling constraints. Future distributed modes may introduce explicit placement policies. |
+| Restore placement | Kuasar selects a compatible Ready placement when starting a newly created Sandbox. Phase 1 uses only entries with `cacheState=LocalReady`; future distributed artifacts may allow lazy pull before restore. AgentCube does not choose a placement for an already-running warm Pod. |
 | Concurrency | SnapshotController may build or materialize placements in parallel. |
 | Partial failure | If at least one node becomes Ready, the aggregate `SnapStart.status.snapshot.phase` can be `Ready` and `activeMode=Snapshot`; failed nodes are reported through `Degraded` condition and per-node Redis state. |
 | Total failure | If no selected placement can become restorable, aggregate phase becomes `Failed` and `activeMode=Cold`. |
@@ -679,27 +681,43 @@ This separation is intentional. Phase 1 implements the placement entries with no
 
 ### 6.3 Session Create Path
 
-`handleSandboxCreate()` remains scoped, but the RBAC ordering is important. It must first resolve the runtime and query SnapStart availability so it can determine the actual Kubernetes resource type to create: `sandboxes` when a ready snapshot forces the direct restore path, or `sandboxclaims` when the existing SandboxWarmPool path is used. Only after this decision should it perform SAR. This keeps the SAR resource type aligned with the resource that `buildSandboxByCodeInterpreter()` actually creates.
+`handleSandboxCreate()` remains responsible for the AgentCube allocation decision only. SnapStart availability does not change which Kubernetes resource the caller is authorized to create. If `CodeInterpreter.spec.warmPoolSize > 0`, AgentCube uses the existing `SandboxClaim` path. Otherwise it creates a direct Sandbox. Kuasar evaluates SnapStart only when a new Sandbox is started.
 
 ```go
 ci := getCIFromInformer(...)
-readySnap := selectReadySnapshot(...)
-forceDirectSandbox := readySnap != nil
 
-sarResource := "sandboxclaims"
-if forceDirectSandbox || ci.Spec.WarmPoolSize == 0 {
-    sarResource = "sandboxes"
+if ci.Spec.WarmPoolSize > 0 {
+    checkResourceCreatePermission(ctx, userDynamicClient, namespace, "sandboxclaims")
+    claim := buildSandboxClaimByCodeInterpreter(ci, req)
+    return createSandboxClaim(ctx, dynamicClient, claim)
 }
-checkResourceCreatePermission(ctx, userDynamicClient, namespace, sarResource)
 
-sandbox := buildSandboxByCodeInterpreter(ci, req, forceDirectSandbox)
-if readySnap != nil {
-    annotateWithSnapshot(sandbox, readySnap)
-}
-createSandbox(ctx, dynamicClient, sandbox, req)
+checkResourceCreatePermission(ctx, userDynamicClient, namespace, "sandboxes")
+sandbox := buildSandboxByCodeInterpreter(ci, req)
+attachWorkloadSnapStartIntent(sandbox, ci)
+return createSandbox(ctx, dynamicClient, sandbox, req)
 ```
 
-The restore path must not bypass RBAC. The key constraint is that snapshot availability is checked before SAR, because SAR must validate the same resource type that the request will actually create.
+The same rule applies to SandboxWarmPool refill: the refill controller creates an ordinary Sandbox carrying workload-level SnapStart intent. Kuasar may restore it from a compatible template during its first startup. Once Ready, that Sandbox enters the pool and later claim binding does not invoke restore again.
+
+The AgentCube API and SAR behavior therefore remain stable:
+
+| AgentCube path | Kubernetes resource | Required SAR permission | SnapStart behavior |
+|---|---|---|---|
+| SandboxWarmPool claim | `sandboxclaims` | `sandboxclaims/create` | Bind an already-running Sandbox. Never append restore annotations and never restore again. |
+| Direct Sandbox create | `sandboxes` | `sandboxes/create` | Carry workload-level SnapStart intent. Kuasar chooses compatible restore or cold start. |
+| SandboxWarmPool refill | `sandboxes` created by the controller | Controller ServiceAccount permission | Kuasar may use SnapStart during initial startup before the Sandbox enters the pool. |
+
+Kuasar restore eligibility is not just `phase=Ready`. A placement is usable only when all of the following are true:
+
+| Check | Requirement |
+|---|---|
+| Cache state | `cacheState=LocalReady` in Phase 1 NodeLocal mode. |
+| Node eligibility | The placement node is currently Ready and still satisfies the referenced runtime's scheduling constraints. |
+| Runtime version | The placement's `templateKey` / `runtimeSpecHash` / checkpoint / protocol version match the current runtime inputs and the current SnapStart status. |
+| Artifact compatibility | For future distributed artifacts, the placement has passed node compatibility checks before becoming `LocalReady`. |
+
+If any check fails, Kuasar treats the placement as unavailable and cold-starts the newly created Sandbox. It must not restore from an old placement while waiting for SnapshotController to invalidate or delete it.
 
 The restore path and cold-start path both reuse the existing `createSandbox()` transaction:
 
@@ -709,21 +727,33 @@ The restore path and cold-start path both reuse the existing `createSandbox()` t
 4. Write final session information to Redis.
 5. On any failure, delete the Sandbox CR and remove the Redis placeholder.
 
-If a snapshot restore attempt fails, `createSandbox()` completes rollback for the annotated Sandbox first. Workload Manager then creates a new, unannotated cold-start Sandbox through an independent `createSandbox()` transaction. This prevents orphan Sandbox CRs and avoids reusing a partially written Redis session record.
+If a snapshot restore attempt fails before the Sandbox becomes Ready, Kuasar cold-starts the same newly created Sandbox when the failure is recoverable. AgentCube observes the final Sandbox readiness result through the existing transaction. The Kuasar integration must surface restore fallback metrics and events without requiring Workload Manager to create a replacement Sandbox CR.
 
-The fallback cold-start Sandbox remains a business session only. Workload Manager must not mark it as a build sandbox, must not call Kuasar `template-create` from it, and must not hand it back to SnapshotController as a snapshot source. Any replacement placement build triggered by the failure is a separate SnapshotController reconcile using a new clean build sandbox.
+The fallback cold-start Sandbox remains a business session only. AgentCube and Kuasar must not promote it into a snapshot source. Any replacement placement build triggered by restore failures is a separate SnapshotController reconcile using a new clean build sandbox.
 
-When a ready snapshot placement is selected, `forceDirectSandbox=true` bypasses the `warmPoolSize > 0 -> SandboxClaim` branch. Snapshot restore requires a direct Sandbox CR because the controller must attach the `snapshot-template-id` annotation and constrain `spec.nodeName` to a node whose placement is currently restorable. In Phase 1 this means the node owns a local Kuasar template. With future distributed artifacts, it can also mean the node has already materialized or can synchronously materialize the artifact before restore.
+This design requires a Kuasar-facing workload-level SnapStart intent and template-discovery contract. AgentCube publishes template lifecycle metadata, while Kuasar owns compatible placement selection, node-local restore, and cold-start fallback during sandbox startup. Phase 1 may transport intent through annotations, but those annotations describe the workload template to use; Workload Manager must not select a concrete node-local template ID for a user request.
+
+The identifier chain is intentionally layered:
+
+| Identifier | Example | Produced by | Scope and purpose |
+|---|---|---|---|
+| `SnapStart.spec.runtimeRef` | `CodeInterpreter/python-interpreter` | Platform administrator | User-facing association that enables SnapStart for a runtime. |
+| `agentcube.volcano.sh/snapstart-ref` | `default/python-snapstart` | AgentCube | Internal logical intent automatically propagated to newly created Sandboxes. |
+| `templateKey` / `kuasar.io/template-key` | `fork:sha256-a1b2c3d4e5f6:InterpreterReady:spec-8f3a1b9c` | SnapshotController | Versioned logical startup artifact. SnapshotController supplies it to Kuasar during `create-template`; SandboxReconciler propagates the current logical key during startup. |
+| Kuasar `template_id` | `tpl-node-b-456` | Kuasar | Node-local implementation identifier resolved internally from `templateKey`; never supplied by a user or selected by Workload Manager. |
+
+In Phase 1, SnapshotController keeps Redis/ValKey placement metadata for lifecycle management, status aggregation, invalidation, and orphan GC. Kuasar keeps the node-local `templateKey -> template_id` mapping needed by the startup data path. A future distributed implementation may replace the local mapping with artifact materialization, but it must preserve the same user-facing `runtimeRef` contract.
 
 ### 6.4 Restore Sandbox Lifecycle
 
-SandboxReconciler detects restore annotations and follows a restore-specific state machine:
+For a newly created Sandbox, SandboxReconciler propagates the logical SnapStart intent and Kuasar follows a restore-specific state machine:
 
 ```text
-Sandbox created with snapshot annotations
-  -> bind to template node
-  -> SandboxReconciler translates AgentCube annotations into Kuasar annotations before Pod creation
-  -> Kuasar restores from WarmForkSnapshot
+Sandbox created with logical SnapStart intent
+  -> Kubernetes schedules Sandbox startup
+  -> SandboxReconciler propagates logical intent before Pod creation
+  -> Kuasar resolves a compatible node-local template ID
+  -> Kuasar restores from WarmForkSnapshot when available
   -> sandboxer sends PREPARE to the runtime
   -> runtime replies READY
   -> sandboxer sends COMMIT
@@ -731,7 +761,7 @@ Sandbox created with snapshot annotations
   -> Sandbox Ready
 ```
 
-If restore fails, the instance is destroyed. Depending on failure reason, the request either retries cold start or reports an error.
+If no compatible local template exists, or a recoverable restore attempt fails before readiness, Kuasar cold-starts the same Sandbox. A claimed SandboxWarmPool slot does not enter this state machine because it is already running.
 
 ### 6.5 SandboxInfo Extension
 
@@ -746,30 +776,23 @@ Only minimal fields should be added:
 Snapshot placement metadata is stored as a Redis / ValKey Hash:
 
 ```text
-key:   snapshot:{namespace}:{runtime_name}
+key:   snapshot:{namespace}:{snapstart_name}
 field: {node_name}
 value: SnapshotPlacementInfo JSON
 ```
 
-Each field represents one restore placement for the logical snapshot artifact. Phase 1 uses one field per node because Kuasar templates are node-local. Future distributed artifacts can keep the same key/field shape and change only `storageClass` / `cacheState`.
+Each field represents one restore placement for the logical snapshot artifact. The key is scoped by SnapStart name rather than runtime name so future phases can support multiple SnapStart objects pointing to the same runtime without changing the Redis schema. The value also carries `snapStartUID`, so stale fields from a deleted and recreated SnapStart can be ignored during restore selection and cleanup. Phase 1 uses one field per node because Kuasar templates are node-local. Future distributed artifacts can keep the same key/field shape and change only `storageClass` / `cacheState`.
 
 The store must expose concrete snapshot placement operations:
 
 ```go
 type SnapshotStore interface {
     StoreSnapshot(ctx context.Context, info *SnapshotPlacementInfo) error
-    GetSnapshotNodes(ctx context.Context, namespace, runtimeName string) ([]*SnapshotPlacementInfo, error)
-    DeleteSnapshot(ctx context.Context, namespace, runtimeName, nodeName string) error
-    DeleteAllSnapshots(ctx context.Context, namespace, runtimeName string) error
+    GetSnapshotNodes(ctx context.Context, namespace, snapStartName string) ([]*SnapshotPlacementInfo, error)
+    DeleteSnapshot(ctx context.Context, namespace, snapStartName, nodeName string) error
+    DeleteAllSnapshots(ctx context.Context, namespace, snapStartName string) error
     ListSnapshotTemplateIDs(ctx context.Context) ([]string, error)
 }
-
-type SnapshotArtifactStorageClass string
-
-const (
-    SnapshotArtifactStorageClassNodeLocal   SnapshotArtifactStorageClass = "NodeLocal"
-    SnapshotArtifactStorageClassDistributed SnapshotArtifactStorageClass = "Distributed"
-)
 
 type SnapshotCacheState string
 
@@ -785,6 +808,8 @@ const (
 
 type SnapshotPlacementInfo struct {
     Namespace   string               `json:"namespace"`
+    SnapStartName string             `json:"snapStartName"`
+    SnapStartUID  string             `json:"snapStartUID"`
     RuntimeName string               `json:"runtimeName"`
     NodeName    string               `json:"nodeName"`
     NodeIP      string               `json:"nodeIP"`
@@ -792,9 +817,14 @@ type SnapshotPlacementInfo struct {
     StorageClass SnapshotArtifactStorageClass `json:"storageClass,omitempty"`
     LocalTemplateID string             `json:"localTemplateId,omitempty"`
     TemplateKey string               `json:"templateKey,omitempty"`
+    RuntimeGeneration int64           `json:"runtimeGeneration,omitempty"`
+    RuntimeSpecHash string            `json:"runtimeSpecHash,omitempty"`
+    Checkpoint string                 `json:"checkpoint,omitempty"`
+    ProtocolVersion string            `json:"protocolVersion,omitempty"`
+    ImageDigest string                `json:"imageDigest,omitempty"`
     ArtifactURI string                `json:"artifactUri,omitempty"`
     ArtifactDigest string             `json:"artifactDigest,omitempty"`
-    Phase       PerNodeSnapshotPhase `json:"phase"`
+    Phase       SnapshotPhase        `json:"phase"`
     CacheState  SnapshotCacheState   `json:"cacheState,omitempty"`
     StartedAt   time.Time            `json:"startedAt,omitempty"`
     ReadyAt     time.Time            `json:"readyAt,omitempty"`
@@ -802,13 +832,15 @@ type SnapshotPlacementInfo struct {
 }
 ```
 
+Version fields are mandatory for restore selection. `RuntimeGeneration` records the referenced runtime generation observed during build. `RuntimeSpecHash`, `Checkpoint`, `ProtocolVersion`, `ImageDigest`, and `TemplateKey` describe the startup state that was snapshotted. The Kuasar-facing restore selector compares these fields with the currently published logical artifact version before using a placement. This prevents a stale Redis field from serving a session after `CodeInterpreter` or `AgentRuntime` has changed but before SnapshotController has completed invalidation cleanup.
+
 The operations map to the following behavior:
 
 | Operation | Purpose |
 |---|---|
-| `StoreSnapshot` with `phase=Building` / `cacheState=Building` | Two-phase placeholder before Kuasar `template-create` or future artifact materialization; prevents orphan ambiguity after controller crash. |
+| `StoreSnapshot` with `phase=Creating` / `cacheState=Building` | Two-phase placeholder before Kuasar `create-template` or future artifact materialization; prevents orphan ambiguity after controller crash. |
 | `StoreSnapshot` with `phase=Ready` / `cacheState=LocalReady` | Publish usable placement metadata for restore selection. |
-| `GetSnapshotNodes` | Session creation lookup and cleanup enumeration. |
+| `GetSnapshotNodes` | Kuasar-facing template discovery and cleanup enumeration. |
 | `DeleteSnapshot` | Remove one node field, such as after node deletion or per-node invalidation. |
 | `DeleteAllSnapshots` | Remove Redis metadata first during cleanup to stop new restores. |
 | `ListSnapshotTemplateIDs` | Support Phase 1 orphan GC by diffing `localTemplateId` values against Kuasar `list-templates`. |
@@ -821,7 +853,7 @@ SnapStart deletion uses a finalizer:
 delete SnapStart
   -> finalizer runs
   -> list metadata
-  -> delete Redis metadata first to stop Workload Manager from starting new restores
+  -> delete Redis metadata first to stop Kuasar from starting new restores
   -> retry Kuasar delete-template on relevant nodes until lease_count reaches zero
   -> remove finalizer
 ```
@@ -850,9 +882,11 @@ Node lifecycle rules:
 
 | Node event | Handling |
 |---|---|
-| Node NotReady beyond grace period | Mark the per-node snapshot phase `Unavailable`; `tryAnnotateWithSnapshot()` excludes that node. |
-| Node recovers | Call Kuasar `list-templates` to verify the template still exists; mark Ready if present, otherwise rebuild on that node. |
-| Node deleted | Delete that node's Redis Hash field and build replacement templates on remaining eligible nodes if needed. |
+| Node NotReady beyond grace period | Mark the per-node snapshot phase `Unavailable`; the Kuasar-facing restore selector excludes that node. |
+| Node recovers | Clear the stale `Unavailable` Redis entry and build a fresh template on that node. The controller does not trust a local template across node unavailability. |
+| Node deleted or label removed | Mark that node's Redis Hash field `Unavailable`; restore selection excludes it. |
+| New eligible node | Build a fresh node-local template in the background. |
+| Per-node build fails | Keep serving from Ready nodes, set `Degraded=True`, and retry that node in the background after a minimum delay. |
 | Ready node count below eligible count | Keep serving from Ready nodes, set `Degraded=True`, and emit/record the Ready node ratio. |
 
 Manual rebuild uses:
@@ -863,7 +897,7 @@ metadata:
     agentcube.volcano.sh/force-rebuild: "true"
 ```
 
-The controller removes this annotation only after the rebuild succeeds. If cleanup or rebuild fails, the annotation remains so the next reconcile retries automatically.
+The controller removes this annotation only after the rebuild succeeds. If cleanup or rebuild fails, the annotation remains while the bounded retry cycle runs. After all three attempts fail, remediation is explicit: set the annotation to `"false"` and then back to `"true"` to start a new cycle.
 
 ### 6.8 One Runtime, One SnapStart
 
@@ -938,7 +972,7 @@ picod reaches `InterpreterReady` through an explicit ready-waiting sequence:
 2. Bind and listen on the inject socket, defaulting to `/run/warmfork-readiness.sock`.
 3. Enter Waiting state before accepting any user task.
 4. Set internal waiting flags with atomic visibility so the HTTP status goroutine observes the same state as the main runtime goroutine.
-5. Return 503 or 425 for business APIs such as code execution and file mutation while Waiting.
+5. Do not register business APIs such as code execution and file mutation in a snapshot build sandbox. They return 404 for the entire build-sandbox lifetime.
 6. Report `safeToSnapshot=true` from `GET /runtime/status` only after the inject socket is listening, no user state is loaded, `activeTasks=0`, and workspace state is clean.
 7. Block on `accept()` until Kuasar connects for probe or restore injection.
 
@@ -1011,10 +1045,10 @@ Before snapshot, the runtime must reject polluted state:
 
 ### 8.1 AgentCube Access to Kuasar Admin API
 
-Workload Manager should not talk to Kuasar node sockets directly. Add an HTTP proxy in `agentd`:
+SnapshotController should not talk to Kuasar node sockets directly. Add an HTTP proxy in `agentd`:
 
 ```text
-Workload Manager -> agentd on target node -> Kuasar Admin socket
+SnapshotController -> agentd on target node -> Kuasar Admin socket
 ```
 
 The proxy provides:
@@ -1024,41 +1058,42 @@ The proxy provides:
 | Authentication and authorization | Prevent arbitrary access to node-local Kuasar API. |
 | Operation whitelist | Only expose required snapshot operations. |
 | Request validation | Restrict paths, template IDs, and payload size. |
-| Audit logs | Record template create/delete/list and restore operations. |
+| Audit logs | Record template create/delete/list operations. |
 
 Phase 1 minimum security requirements:
 
 | Requirement | Implementation |
 |---|---|
 | Listen address | Listen only on the agentd Pod IP, not `hostNetwork` and not `0.0.0.0`. |
-| Network isolation | NetworkPolicy allows only Workload Manager Pods to access agentd `:9090`. |
-| Operation whitelist | Forward only `template-create`, `delete-template`, and `list-templates`; reject all other actions. |
-| Caller authentication | Bearer token stored in a Kubernetes Secret and mounted into Workload Manager. |
+| Network isolation | NetworkPolicy allows only the Workload Manager Pods hosting SnapshotController to access agentd `:9090`. |
+| Operation whitelist | Forward only `create-template`, `delete-template`, and `list-templates`; reject all other actions. |
+| Caller authentication | Bearer token stored in a Kubernetes Secret and mounted into the Workload Manager Pods hosting SnapshotController. |
 
-Recommended production hardening includes mTLS between Workload Manager and agentd, structured audit logs for every Kuasar Admin call, and rate limiting to prevent accidental request storms.
+Recommended production hardening includes mTLS between SnapshotController and agentd, structured audit logs for every Kuasar Admin call, and rate limiting to prevent accidental request storms.
 
 ### 8.2 Minimal Kuasar Admin Contract
 
-`template-create` request fields:
+`create-template` request fields:
 
 | Field | Meaning |
 |---|---|
 | `sandbox_id` | Build sandbox to snapshot. |
 | `snapshot_type` | `warm_fork` for WarmForkSnapshot, or `environment` for EnvironmentSnapshot. |
 | `key` | AgentCube-computed template key, such as `fork:sha256-a1b2c3d4e5f6:InterpreterReady:spec-8f3a1b9c`. |
-| `owner` | Metadata used for orphan GC attribution: namespace, runtime name, SnapStart UID, and node name. |
+| `owner` | Metadata used for orphan GC attribution: namespace, runtime name, SnapStart name/UID, and node name. |
 
 Example:
 
 ```json
 {
-  "action": "template-create",
+  "action": "create-template",
   "sandbox_id": "<sandbox_id>",
   "snapshot_type": "warm_fork",
   "key": "<computed_template_key>",
   "owner": {
     "namespace": "<namespace>",
     "runtime_name": "<codeinterpreter_name>",
+    "snap_start_name": "<snapstart_name>",
     "snap_start_uid": "<snapstart_uid>",
     "node_name": "<node_name>"
   }
@@ -1070,11 +1105,11 @@ Example:
 | Field | Meaning |
 |---|---|
 | `template_id` | Kuasar-assigned template identifier. |
-| `key` | AgentCube-computed template key supplied at `template-create` time. |
+| `key` | AgentCube-computed template key supplied at `create-template` time. |
 | `snapshot_type` | Snapshot type. |
 | `created_at` | Creation timestamp. |
 | `lease_count` | Number of active restores using this template. |
-| `owner` | Owner metadata supplied at `template-create` time. |
+| `owner` | Owner metadata supplied at `create-template` time. |
 | `labels` | Optional labels returned by Kuasar. |
 
 AgentCube orphan GC must first filter templates whose `owner["snap_start_uid"]` belongs to this AgentCube installation, then diff them against Redis metadata, then apply a grace-period check before deletion. Templates without owner metadata are outside AgentCube GC scope.
@@ -1091,23 +1126,27 @@ Build sandbox annotations:
 | `kuasar.io/warm-fork-ready-protocol-version: "1"` | Enables WarmFork readiness protocol. |
 | `agentcube.volcano.sh/template-sandbox: "true"` | Marks the sandbox as build-only; it is deleted after snapshot creation. |
 
-Restore Sandbox CR annotations added by Workload Manager:
+Logical restore intent automatically added by AgentCube when it creates a new Sandbox:
 
 | Annotation | Purpose |
 |---|---|
-| `agentcube.volcano.sh/snapshot-template-id` | Selects the restore path in SandboxReconciler. |
-| `agentcube.volcano.sh/restored-from-snapshot` | Stores the AgentCube template key for observability. |
+| `agentcube.volcano.sh/snapstart-ref` | Identifies the associated `SnapStart` object as `<namespace>/<name>`. This is an internal propagation contract derived from `SnapStart.spec.runtimeRef`, not a user-supplied Sandbox option. |
+| `agentcube.volcano.sh/snapstart-uid` | Protects against stale intent after a `SnapStart` object is deleted and recreated with the same name. |
 
-Kuasar protocol annotations written by SandboxReconciler before Pod creation:
+The logical intent must never contain a Kuasar `template_id` or force a concrete restore node. A Kuasar template ID is node-local implementation metadata. Kuasar resolves it internally from the logical intent and the compatible templates available on the actual startup node.
+
+Kuasar-facing protocol annotations propagated by SandboxReconciler before Pod creation:
 
 | Annotation | Purpose |
 |---|---|
 | `kuasar.io/snapshot-type: "warm-fork"` | Tells Kuasar to restore from a WarmFork template. |
-| `kuasar.io/template-key` | Template key converted from `agentcube.volcano.sh/restored-from-snapshot`. |
+| `kuasar.io/template-key` | Logical artifact version resolved from the associated SnapStart metadata. Kuasar uses it to discover a compatible local template; it is not a node-local template ID. |
 | `kuasar.io/task-id` | Injected session/task ID. |
 | `kuasar.io/task-context` | Opaque JSON context, including the workspace path. |
 | `kuasar.io/task-env/<NAME>` | Environment override passed to runtime. |
 | `kuasar.io/warm-fork-readiness-socket` | Optional socket path override. |
+
+After a successful restore, AgentCube records the resolved logical template key in `SandboxInfo.RestoredFromSnapshot` for observability. Cold-started Sandboxes and claimed SandboxWarmPool slots leave this field empty.
 
 ---
 
@@ -1128,7 +1167,7 @@ Creating -> Failed
 Ready -> Invalidated
 ```
 
-`Pending`, `Creating`, `Ready`, `Failed`, and `Invalidated` are CRD-level aggregate phases. Per-node template state is stored in Redis and can use phases such as `Building`, `Ready`, `Failed`, `Unavailable`, and `Invalidated`. The two layers must not be mixed in `SnapStart.status.snapshot.phase`.
+`Pending`, `Creating`, `Ready`, `Failed`, and `Invalidated` are CRD-level aggregate phases. Placement state in Redis reuses the same `SnapshotPhase` values for coarse state and uses `cacheState` for placement-specific details such as `Building`, `Pulling`, `LocalReady`, `Unavailable`, and `Invalidated`. The two layers must not be mixed in `SnapStart.status.snapshot.phase`: CRD status reports aggregate readiness, while Redis placement entries report individual restore availability.
 
 ### 9.2 Sandbox Lifecycle
 
@@ -1146,9 +1185,10 @@ Create Sandbox
 Restore path:
 
 ```text
-Create Sandbox with snapshot annotations
-  -> select node with ready template
-  -> Kuasar restore
+Create Sandbox with logical SnapStart intent
+  -> schedule Sandbox startup
+  -> Kuasar resolves a compatible local template
+  -> Kuasar restore when available
   -> sandboxer sends PREPARE
   -> runtime replies READY
   -> sandboxer sends COMMIT
@@ -1158,23 +1198,7 @@ Create Sandbox with snapshot annotations
 
 ---
 
-## 10. SnapStart WarmPool
-
-SnapStart WarmPool is optional and not required for Phase 1.
-
-It pre-restores a number of instances from a snapshot template so session creation can avoid both cold start and restore time. It costs memory and idle CPU, so it must be explicitly configured and observable.
-
-Use it only when:
-
-| Condition | Reason |
-|---|---|
-| Restore latency is still user-visible | WarmPool removes restore from the critical path. |
-| Traffic is bursty and predictable | Pre-restored slots can absorb bursts. |
-| Resource budget is acceptable | Warm slots consume memory and CPU. |
-
----
-
-## 11. State Isolation
+## 10. State Isolation
 
 Every restored session must have isolated mutable state:
 
@@ -1189,9 +1213,11 @@ Every restored session must have isolated mutable state:
 
 The snapshot must not include user credentials, task prompts, URLs, cookies, tokens, or tenant-specific files.
 
+Phase 1 rejects `CodeInterpreter.spec.template.environment[]` entries that use `valueFrom`. Silently dropping a `SecretKeyRef`, `ConfigMapKeyRef`, or other indirect source would make restored sessions behave differently from cold-start sessions, while baking resolved Secret values into a shared template would leak credentials. Future protocol versions may add explicit post-restore injection for approved environment sources. Literal environment values remain part of the snapshot input and must not contain tenant-specific credentials.
+
 ---
 
-## 12. Failure Handling and Fallback
+## 11. Failure Handling and Fallback
 
 All fallback is transparent to users: the worst user-visible behavior is slower session creation through cold start, not a failed request.
 
@@ -1199,10 +1225,12 @@ All fallback is transparent to users: the worst user-visible behavior is slower 
 
 | Failure | Handling |
 |---|---|
-| Snapshot creation fails, such as Kuasar error or template-create timeout | `snapshot.phase=Failed`, `activeMode=Cold`; all sessions fall back to cold start; retry up to 3 times with exponential backoff, then stop until an administrator triggers force rebuild. |
+| Snapshot creation fails, such as Kuasar error or create-template timeout | `snapshot.phase=Failed`, `activeMode=Cold`; all sessions fall back to cold start; retry up to 3 times with exponential backoff, then stop until an administrator triggers force rebuild. |
 | Snapshot build sandbox startup timeout | Same 3-retry policy. |
 | Kuasar Admin Proxy unreachable | Same 3-retry policy; emit `SnapshotFailed` and operational alert. |
 | Image or args invalidates the snapshot | Rebuild automatically; retry count is reset per rebuild; transition period uses `activeMode=Cold`. |
+
+Retry state is persisted in `SnapStart.status.snapshot.buildFailureCount` and `nextBuildRetryAt`. Informer notifications do not bypass `nextBuildRetryAt`, and automatic retry stops after the third failed attempt. A successful rebuild clears both fields. If a failed manual rebuild exhausted its budget, an administrator explicitly rearms it by setting `agentcube.volcano.sh/force-rebuild: "false"` and then setting it back to `"true"` after remediation.
 
 **Failure type 2: ProtocolNotSupported, no retry**
 
@@ -1217,9 +1245,9 @@ All fallback is transparent to users: the worst user-visible behavior is slower 
 
 | Failure | Handling |
 |---|---|
-| SandboxReconciler fails to restore through Kuasar or the Sandbox CR does not reach Running | The current request falls back to cold start with a normal Sandbox CR. Consecutive restore failures increment `SnapStart.status.snapshot.restoreFailureCount`; after 3 failures, SnapshotController marks the snapshot `Invalidated` and rebuilds it. |
+| Kuasar cannot complete restore or the Sandbox does not reach Running through the restore path | Kuasar cold-starts the same newly created Sandbox for recoverable failures. Consecutive restore failures increment `SnapStart.status.snapshot.restoreFailureCount`; after 3 failures, SnapshotController marks the snapshot `Invalidated` and rebuilds it. |
 
-`RestoreFailureCount` is persisted in `SnapStart.status.snapshot`, not memory or Redis, so controller restarts do not lose it. Workload Manager PATCHes this count during fallback; SnapshotController watches it and triggers rebuild when the count reaches 3. A successful rebuild resets it to 0.
+`RestoreFailureCount` is persisted in `SnapStart.status.snapshot`, not memory or Redis, so controller restarts do not lose it. The Kuasar integration reports fallback to AgentCube, which PATCHes this count; SnapshotController watches it and triggers rebuild when the count reaches 3. A successful rebuild resets it to 0.
 
 Fallback cold-start sessions are never snapshot candidates. They may trigger counters, events, or a later SnapshotController reconcile, but the replacement snapshot must always come from a new build sandbox that has not served user traffic.
 
@@ -1233,9 +1261,9 @@ Fallback must be observable. Silent fallback hides performance regressions and s
 
 ---
 
-## 13. Observability
+## 12. Observability
 
-### 13.1 Kubernetes Events
+### 12.1 Kubernetes Events
 
 Emit events such as:
 
@@ -1245,11 +1273,11 @@ Emit events such as:
 | `SnapshotReady` | Template is ready on one or more nodes. |
 | `SnapshotFailed` | Snapshot creation failed, including failedReason. |
 | `SnapshotInvalidated` | Key changed or maxAge expired; `activeMode` switches back to `Cold`. |
-| `SandboxRestoredFromSnapshot` | A Sandbox CR with `snapshot-template-id` reaches Running and SandboxReconciler confirms restore completion. |
-| `SandboxRestoreFallback` | Restore-path Sandbox CR fails to reach Running and Workload Manager creates a normal cold-start Sandbox CR. |
+| `SandboxRestoredFromSnapshot` | A newly created Sandbox reaches Running after Kuasar confirms restore from the logical SnapStart intent. |
+| `SandboxRestoreFallback` | Kuasar reports that a newly created Sandbox could not use the intended snapshot and cold-started instead. |
 | `SnapshotContaminationDetected` | Runtime did not reach a safe snapshot state, such as `safeToSnapshot=false`. |
 
-### 13.2 Metrics
+### 12.2 Metrics
 
 Recommended metrics:
 
@@ -1259,7 +1287,7 @@ Recommended metrics:
 | `agentcube_snapstart_build_duration_seconds` | `runtime_kind`, `checkpoint` |
 | `agentcube_snapstart_restore_total` | `result`, `node`, `runtime_kind` |
 | `agentcube_snapstart_restore_duration_seconds` | `node`, `runtime_kind` |
-| `agentcube_session_startup_duration_seconds` | `path=cold/snapshot/snapstart_warmpool/sandbox_warmpool` |
+| `agentcube_session_startup_duration_seconds` | `path=cold/snapshot/sandbox_warmpool` |
 | `agentcube_snapstart_template_ready` | `snapstart`, `node` |
 | `agentcube_snapstart_artifact_ready` | `snapstart`, `storage_class` |
 | `agentcube_snapstart_placement_cache_state` | `snapstart`, `node`, `cache_state` |
@@ -1269,38 +1297,38 @@ Operational metrics should preserve latency attribution:
 
 | Dimension | Requirement |
 |---|---|
-| Startup path | Always label session startup with `cold`, `snapshot`, `snapstart_warmpool`, or `sandbox_warmpool`. |
+| Startup path | Always label session startup with `cold`, `snapshot`, or `sandbox_warmpool`. |
 | Restore failure reason | Count fallback by reason so restore failures, missing metadata, unavailable nodes, and protocol failures are distinguishable. |
 | Node readiness | Expose ready template count versus eligible node count for `Degraded` diagnosis. |
 | Latency breakdown | Track scheduling, restore, and runtime-ready portions separately where implementation can observe them. |
 
 ---
 
-## 14. Code Change Areas
+## 13. Code Change Areas
 
-### 14.1 File-Level Change List
+### 13.1 File-Level Change List
 
 Expected changes:
 
 | File | Change |
 |---|---|
-| `pkg/apis/runtime/v1alpha1/snapstart_types.go` | Add `SnapStart` CRD types: `SnapStartSpec`, `SnapStartStatus`, `SnapshotStatus`, `SnapshotArtifactStatus`, `SnapshotPlacementStatus`, `SnapStartArtifactSpec`, `SnapStartPlacementSpec`, `PerNodeSnapshotPhase`, `SnapStartWarmPoolSpec`, `RuntimeReference`; include `Conditions []metav1.Condition` and `RestoreFailureCount`. |
+| `pkg/apis/runtime/v1alpha1/snapstart_types.go` | Add `SnapStart` CRD types: `SnapStartSpec`, `SnapStartStatus`, `SnapshotStatus`, `SnapshotArtifactStatus`, `SnapStartArtifactSpec`, `RuntimeReference`; include aggregate node counts, `Conditions []metav1.Condition`, `RestoreFailureCount`, and persisted build-retry state. |
 | `pkg/common/types/sandbox.go` | Add `SandboxInfo.RestoredFromSnapshot` for observability; cold-start path leaves it empty. |
 | `pkg/store/interface.go` | Add artifact-aware snapshot placement operations: `StoreSnapshot`, `GetSnapshotNodes`, `DeleteSnapshot`, `DeleteAllSnapshots`, and `ListSnapshotTemplateIDs`. |
-| `pkg/store/store_redis.go` / `store_valkey.go` | Implement snapshot placement Hash storage: `snapshot:{ns}:{runtime_name}` with field `{node_name}` and value `SnapshotPlacementInfo`. |
-| `pkg/workloadmanager/workload_builder.go` | Add `forceDirectSandbox bool` to `buildSandboxByCodeInterpreter()`; when true, bypass `warmPoolSize > 0 -> SandboxClaim` and build a direct Sandbox CR. |
-| `pkg/workloadmanager/server.go` | Start SnapshotController goroutine from `Start()`. |
-| `pkg/workloadmanager/handlers.go` | In `handleSandboxCreate()`: query snapshot availability first, derive `forceDirectSandbox`, run SAR against the actual resource type, build Sandbox with `forceDirectSandbox`, inject snapshot annotations, and reuse existing `createSandbox()` transaction. |
-| `pkg/workloadmanager/sandbox_reconciler.go` | Add restore branch for `snapshot-template-id`; drive Kuasar WarmForkSnapshot restore and convert AgentCube annotations to Kuasar annotations before Pod creation. |
-| `pkg/workloadmanager/snapshot_controller.go` | Add SnapshotController: watch SnapStart, maintain reverse runtimeRef index, detect conflicts, run per-node build jobs, manage conditions/status, and handle node changes. |
-| `pkg/workloadmanager/kuasar_client.go` | Add Kuasar Admin API client for `template-create`, `delete-template`, and `list-templates`. |
+| `pkg/store/store_redis.go` / `store_valkey.go` | Implement snapshot placement Hash storage: `snapshot:{ns}:{snapstart_name}` with field `{node_name}` and value `SnapshotPlacementInfo`, including `snapStartUID` for stale-entry protection. |
+| `pkg/workloadmanager/workload_builder.go` | Preserve the existing `warmPoolSize > 0 -> SandboxClaim` allocation rule. Automatically propagate logical SnapStart intent when building a newly created direct Sandbox or a SandboxWarmPool refill template. |
+| `pkg/workloadmanager/server.go` | Start SnapshotController from `Start()` and maintain the SnapStart reverse index on every replica so new Sandboxes can receive logical SnapStart intent. |
+| `pkg/workloadmanager/handlers.go` | In `handleSandboxCreate()`: preserve existing SAR behavior, create a `SandboxClaim` when SandboxWarmPool is enabled, otherwise create a direct Sandbox carrying automatically derived logical SnapStart intent, and reuse the existing `createSandbox()` transaction. |
+| `pkg/workloadmanager/sandbox_reconciler.go` | Propagate logical SnapStart intent to Kuasar before Pod creation. Do not select a concrete node-local template ID or force a restore node in AgentCube. |
+| `pkg/workloadmanager/snapshot_controller.go` | Add leader-elected SnapshotController: watch SnapStart, maintain reverse runtimeRef index, detect conflicts, run per-node build jobs through a rate-limiting workqueue, manage conditions/status, and handle node changes. |
+| `pkg/workloadmanager/kuasar_client.go` | Add Kuasar Admin API client for `create-template`, `delete-template`, and `list-templates`. |
 | `pkg/workloadmanager/admission_webhook.go` | Add validating webhook for runtimeRef uniqueness and Phase 1 `runtimeRef.kind=CodeInterpreter` enforcement. |
 | `pkg/agentd/kuasar_proxy.go` | Add Kuasar Admin HTTP Proxy: Pod IP listener, action whitelist, Bearer token authentication. |
 | `pkg/agentd/agentd.go` | No lifecycle change required; restore and cold-start sandboxes share deletion/TTL handling. |
-| `pkg/picod/server.go` | Add `GET /runtime/status`; business APIs return 503/425 while Waiting. |
+| `pkg/picod/server.go` | Add `GET /runtime/status`; snapshot build sandboxes do not register business APIs. |
 | `pkg/picod/execute.go` | Implement SnapStart protocol: bind inject socket, `accept()`, signal Waiting, set `safeToSnapshot=true`; persistent kernel work remains separate. |
 
-### 14.2 Phase 1 runtimeRef Scope
+### 13.2 Phase 1 runtimeRef Scope
 
 Phase 1 supports:
 
@@ -1309,7 +1337,7 @@ Phase 1 supports:
 | CodeInterpreter | Full Phase 1 target. |
 | AgentRuntime | Rejected by the validating webhook in Phase 1 with HTTP 400 and message `AgentRuntime SnapStart is Phase 2 only`. Cold-start AgentRuntime behavior is unaffected. |
 
-### 14.3 RBAC
+### 13.3 RBAC
 
 Required permissions:
 
@@ -1323,15 +1351,18 @@ Required permissions:
 | SnapshotController / Workload Manager ServiceAccount | `pods` | get, list | Read `containerStatuses[].imageID` if agent-sandbox status does not expose it. |
 | SnapshotController / Workload Manager ServiceAccount | `events` | create | Emit SnapshotBuildStarted / SnapshotReady / SnapshotFailed events. |
 | SnapshotController / Workload Manager ServiceAccount | `secrets` | get | Read agentd proxy Bearer token. |
-| Workload Manager request path | `selfsubjectaccessreviews` | create | Check caller permission for `sandboxes` or `sandboxclaims` after snapshot availability determines the actual resource type. |
+| Workload Manager ServiceAccount | `leases.coordination.k8s.io` | get, list, watch, create, update, patch, delete | Elect controller-runtime reconcilers and SnapshotController independently so multiple HTTP replicas do not mutate lifecycle state concurrently. |
+| Workload Manager request path | `selfsubjectaccessreviews` | create | Check caller permission for `sandboxes` or `sandboxclaims` according to the existing AgentCube allocation path. |
 | Workload Manager request path | `networkpolicies` | get | Optional audit that agentd proxy NetworkPolicy is configured. |
 | agentd DaemonSet | hostPath `/run/vmm-sandboxer-admin.sock` | mount in Pod spec | Access Kuasar Admin Unix socket; this is not an RBAC resource. |
 
+Caller SAR checks follow the existing AgentCube allocation path. A runtime with `CodeInterpreter.spec.warmPoolSize > 0` uses `sandboxclaims/create`; otherwise direct creation uses `sandboxes/create`. SnapStart availability must not change the resource type, silently bypass SandboxWarmPool, or alter the caller's authorization boundary. SandboxWarmPool refill uses the controller ServiceAccount and may receive SnapStart acceleration only during the newly created refill Sandbox's initial startup.
+
 ---
 
-## 15. Evolution Plan
+## 14. Evolution Plan
 
-### 15.1 Phase 1: EnvironmentSnapshot Validation + Code Interpreter WarmForkSnapshot
+### 14.1 Phase 1: EnvironmentSnapshot Validation + Code Interpreter WarmForkSnapshot
 
 Goals:
 
@@ -1345,11 +1376,11 @@ Deliverables:
 
 - `SnapStart` CRD and generated clients.
 - SnapshotController skeleton and then full build implementation.
-- Artifact-aware `SnapStartArtifactSpec`, `SnapshotStatus`, and `SnapshotPlacementInfo` metadata, with `artifact.distribution=NodeLocal` / `storageClass=NodeLocal` as the Phase 1 backend.
-- Placement policy support with `MinimumReady` as the default and `AllEligible` available for small clusters or strict locality requirements.
+- Artifact-aware `SnapStartArtifactSpec`, `SnapshotStatus`, and `SnapshotPlacementInfo` metadata, with `artifact.distribution=NodeLocal` as the Phase 1 backend.
+- Node-local templates on every eligible node. Operators control Phase 1 coverage through the `agentcube.volcano.sh/kuasar-snapstart=true` label and runtime scheduling constraints.
 - `agentd` Kuasar Admin HTTP proxy.
-- `tryAnnotateWithSnapshot()` in session creation.
-- SandboxReconciler restore path.
+- Automatic propagation of logical SnapStart intent for newly created direct and SandboxWarmPool refill Sandboxes.
+- Kuasar-facing template-discovery contract and SandboxReconciler intent propagation.
 - picod `GET /runtime/status` and inject socket protocol.
 - E2E coverage for restore path and cold-start fallback.
 
@@ -1357,7 +1388,7 @@ Acceptance criteria:
 
 - `make gen-check` passes.
 - SnapStart status transitions correctly.
-- `status.snapshot.artifact` and `status.snapshot.placement` summarize the logical artifact and ready/eligible node counts without exposing per-node template IDs in CRD status.
+- `status.snapshot.artifact` and aggregate node counts summarize the logical artifact without exposing per-node template IDs in CRD status.
 - Existing CodeInterpreter behavior is unchanged when SnapStart is absent.
 - Two sessions have fully isolated workspaces.
 - Image changes invalidate and rebuild snapshots.
@@ -1366,7 +1397,7 @@ Acceptance criteria:
 
 Performance note: Phase 1 must prove the restore path end to end and provide measured session startup latency. The full target of removing Python import latency depends on the separate picod Jupyter kernel/preload work; before that work lands, protocol correctness is a stronger Phase 1 acceptance requirement than the final 0.5-2 s latency target.
 
-### 15.2 Phase 2: Browser Agent WarmForkSnapshot
+### 14.2 Phase 2: Browser Agent WarmForkSnapshot
 
 **Design Definition**
 
@@ -1556,7 +1587,7 @@ Prerequisites:
 - Kuasar readiness protocol is confirmed to support full BrowserWarmFork.
 - AgentCube Browser Agent reference image is implemented.
 
-### 15.3 Future: Distributed Kuasar Snapshot Artifacts
+### 14.3 Future: Distributed Kuasar Snapshot Artifacts
 
 Phase 1 treats Kuasar templates as node-local materializations of one logical snapshot artifact. Future Kuasar support for cross-node artifact distribution and restore should use the same SnapStart API shape and replace only the placement materialization backend.
 
@@ -1565,7 +1596,7 @@ The target model is:
 ```text
 SnapStart
   -> snapshot.artifact: global identity, digest, storage class, optional URI
-  -> snapshot.placement: where the artifact is currently restorable
+  -> snapshot aggregate node counts: how many placements are currently restorable
   -> Redis/ValKey placement records: per-node cache/materialization state
 ```
 
@@ -1588,7 +1619,7 @@ The mapping is:
 
 | Spec intent | Status storage class | Typical placement state |
 |---|---|---|
-| `artifact.distribution=NodeLocal` | `NodeLocal` | `LocalReady` after local Kuasar `template-create`. |
+| `artifact.distribution=NodeLocal` | `NodeLocal` | `LocalReady` after local Kuasar `create-template`. |
 | `artifact.distribution=LazyRemote` | `Distributed` | `RemoteAvailable` globally, then `Pulling` -> `LocalReady` on selected nodes. |
 | `artifact.distribution=PreDistribute` | `Distributed` | Background materialization drives selected nodes to `LocalReady`. |
 
@@ -1600,7 +1631,7 @@ Build-node and restore-node roles:
 | `LazyRemote` | May be a dedicated artifact build node outside the runtime eligible node set, if Kuasar supports exportable artifacts. | Must be in the runtime eligible node set and must pass artifact compatibility checks before `LocalReady`. |
 | `PreDistribute` | May be a dedicated artifact build node outside the runtime eligible node set. | Must be selected from runtime eligible nodes by placement strategy and materialized before it becomes `LocalReady`. |
 
-For distributed artifacts, `artifactBuildNode` and `restorePlacementNode` are separate concepts. The build node creates or exports the artifact; it is not a scheduling promise for user sessions. Only restore placement nodes can be selected by Workload Manager, and every restore placement node must satisfy the referenced runtime's scheduling constraints.
+For distributed artifacts, `artifactBuildNode` and `restorePlacementNode` are separate concepts. The build node creates or exports the artifact; it is not a scheduling promise for user sessions. Only runtime-eligible nodes may become restore placement nodes, and Kuasar must resolve or materialize a compatible placement on the actual startup node.
 
 Before a distributed placement transitions to `LocalReady`, SnapshotController must verify artifact compatibility for that node. At minimum this includes CPU model compatibility, cloud-hypervisor/Kuasar version compatibility, kernel and VMM snapshot format compatibility, and runtime class compatibility. If compatibility cannot be verified, the placement remains `Failed` or `Unavailable` and must be excluded from restore selection.
 
@@ -1616,16 +1647,16 @@ Placement cache states:
 
 Evolution path:
 
-1. Phase 1 accepts only `artifact.distribution=NodeLocal` and records `storageClass=NodeLocal`.
+1. Phase 1 accepts only `artifact.distribution=NodeLocal`.
 2. When Kuasar exposes export/import or pullable artifact semantics, enable `LazyRemote`; SnapshotController writes a global artifact URI/digest into `status.snapshot.artifact`.
 3. Restore selector prefers `LocalReady`, can optionally choose `RemoteAvailable` if lazy materialization fits the request latency budget, and falls back to cold start when no placement can restore.
 4. Enable `PreDistribute` for high-SLA runtimes; background warm distribution pre-materializes hot artifacts based on restore frequency, node capacity, and cache pressure.
 
-This keeps the session creation path stable: Workload Manager still selects a restore placement, creates a direct Sandbox CR, and SandboxReconciler drives Kuasar restore. The only change is whether the selected placement is already local or first needs artifact materialization.
+This keeps the session creation path stable: AgentCube creates a Sandbox CR carrying logical SnapStart intent, SandboxReconciler propagates the intent, and Kuasar resolves restore internally. The only change is whether the compatible placement is already local or first needs artifact materialization.
 
 ---
 
-## 16. Open Questions
+## 15. Open Questions
 
 | # | Question | Scope | Decision point |
 |---|---|---|---|
@@ -1635,7 +1666,7 @@ This keeps the session creation path stable: Workload Manager still selects a re
 | Q4 | Image digest in template key: read resolved `imageID` after build sandbox is running; verify whether existing CRD status exposes it. | Phase 1 controller | Implementation validation |
 | Q5 | Node-local storage lifecycle: node NotReady, recovery, deletion, and rebuild rules are defined. The metadata model is artifact-aware so future Kuasar distributed artifacts can replace the node-local backend without changing the SnapStart API. | Phase 1 reliability and future distribution | Closed |
 | Q6 | Two-layer WarmPool operational boundary: define metrics, cost attribution, alerts, and latency attribution before combining. | Future Phase 2 | Before Phase 2 design |
-| Q7 | Missing lifecycle paths are covered: deletion finalizer, runtimeRef deletion, manual rebuild, and orphan GC. Manual force-rebuild uses the Section 6.7 behavior: keep the annotation on failure and remove it only after rebuild succeeds. | Phase 1 completeness | Closed |
+| Q7 | Missing lifecycle paths are covered: deletion finalizer, runtimeRef deletion, manual rebuild, and orphan GC. Manual force-rebuild uses the Section 6.7 behavior: keep the annotation on failure, stop after the bounded retry budget, and remove it only after rebuild succeeds. | Phase 1 completeness | Closed |
 | Q8 | Browser Agent reference image: Phase 2 needs an official image with Chromium and BrowserWarmFork protocol support. | Phase 2 Browser Agent | Before Phase 2 development |
 | Q9 | Browser Agent BoringSSL reseed validation: verify Chromium/Node random output after restore from the same snapshot. | Phase 2 Browser Agent | Reference image development |
 | Q10 | Kuasar subprocess constraint for Browser Agent: closed; Kuasar only requires readiness protocol and does not inspect browser subprocess quiescence. | Phase 2 Browser Agent | Closed |
