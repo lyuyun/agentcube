@@ -286,7 +286,12 @@ func (r *CodeInterpreterReconciler) deleteSandboxTemplate(ctx context.Context, c
 	return nil
 }
 
-// convertToPodTemplate converts CodeInterpreterSandboxTemplate to sandboxv1alpha1.PodTemplate
+// convertToPodTemplate converts CodeInterpreterSandboxTemplate to sandboxv1alpha1.PodTemplate.
+// TODO(lyuyun): inject SnapStart annotations (kuasar.io/snapshot-type, kuasar.io/template-key)
+// into the returned PodTemplate so that SandboxWarmPool refill Sandboxes created by the
+// agent-sandbox controller are accelerated by WarmForkSnapshot. This requires looking up the
+// associated SnapStart object and agreeing on how Kuasar handles PREPARE injection for warm
+// slots (warm slots have no session identity at startup; injection happens at claim time).
 func (r *CodeInterpreterReconciler) convertToPodTemplate(template *runtimev1alpha1.CodeInterpreterSandboxTemplate, ci *runtimev1alpha1.CodeInterpreter) sandboxv1alpha1.PodTemplate {
 	// Normalize RuntimeClassName: if it's an empty string, set it to nil
 	runtimeClassName := template.RuntimeClassName

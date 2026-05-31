@@ -373,15 +373,6 @@ func (sc *SnapshotController) reconcile(ctx context.Context, ss *runtimev1alpha1
 				runtimev1alpha1.SnapshotPhaseFailed, msg, nil)
 		}
 	}
-	if ss.Spec.SnapStartWarmPool != nil && ss.Spec.SnapStartWarmPool.Enabled {
-		msg := "snapStartWarmPool.enabled=true is not supported in Phase 1"
-		if alreadyFailedWith(msg) {
-			return nil
-		}
-		return sc.patchStatusForSnapStart(ctx, ss, runtimev1alpha1.SessionStartupModeCold,
-			runtimev1alpha1.SnapshotPhaseFailed, msg, nil)
-	}
-
 	// Register in indexer
 	sc.indexer.upsert(ss)
 
@@ -962,11 +953,7 @@ func (sc *SnapshotController) buildTemplateSandbox(
 		runtimeClassName = nil
 	}
 
-	// For tag images, force Always pull to get the latest digest
 	pullPolicy := ci.Spec.Template.ImagePullPolicy
-	if !strings.Contains(ci.Spec.Template.Image, "@sha256:") {
-		pullPolicy = corev1.PullAlways
-	}
 
 	podSpec := corev1.PodSpec{
 		NodeName:         node.Name,

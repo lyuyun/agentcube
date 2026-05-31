@@ -32,18 +32,6 @@ var (
 		[]string{"namespace", "runtime", "outcome"},
 	)
 
-	// snapshotRestoreTotal counts how many times the snapshot restore path was taken
-	// at session creation. Labels: namespace, runtime, outcome (success|failure).
-	snapshotRestoreTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: "agentcube",
-			Subsystem: "snapstart",
-			Name:      "restore_total",
-			Help:      "Total WarmForkSnapshot restore attempts at session creation, by outcome.",
-		},
-		[]string{"namespace", "runtime", "outcome"},
-	)
-
 	// snapshotStaleBuildResets counts Building entries reset by the stale-build GC sweep.
 	// Labels: namespace, runtime (CodeInterpreter name).
 	snapshotStaleBuildResets = prometheus.NewCounterVec(
@@ -60,7 +48,6 @@ var (
 func init() {
 	prometheus.MustRegister(
 		snapshotBuildDuration,
-		snapshotRestoreTotal,
 		snapshotStaleBuildResets,
 	)
 }

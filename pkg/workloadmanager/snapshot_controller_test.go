@@ -19,7 +19,6 @@ package workloadmanager
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -29,12 +28,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes/fake"
-	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
@@ -135,6 +130,8 @@ func makeTestController(t *testing.T, ci *runtimev1alpha1.CodeInterpreter, store
 	}
 }
 
+// ---------------------------------------------------------------------------
+// shouldInvalidate
 // ---------------------------------------------------------------------------
 // filterSnapshotsByVersion
 // ---------------------------------------------------------------------------
@@ -237,112 +234,6 @@ func TestFilterSnapshotsByVersion(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// selectReadySnapshotNode
-// ---------------------------------------------------------------------------
-
-func TestSelectReadySnapshotNode(t *testing.T) {
-	readyNode := func(name string) *corev1.Node {
-		return &corev1.Node{
-			ObjectMeta: metav1.ObjectMeta{Name: name},
-			Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
-				{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
-			}},
-		}
-	}
-
-	cases := []struct {
-		name     string
-		infos    []*types.SnapshotInfo
-		wantNode string // "" means expect nil
-	}{
-		{
-			name: "picks first LocalReady node",
-			infos: []*types.SnapshotInfo{
-				{NodeName: "node-a", CacheState: string(runtimev1alpha1.CacheStateLocalReady)},
-			},
-			wantNode: "node-a",
-		},
-		{
-			name: "skips Building cacheState",
-			infos: []*types.SnapshotInfo{
-				{NodeName: "node-a", CacheState: string(runtimev1alpha1.CacheStateBuilding)},
-				{NodeName: "node-b", CacheState: string(runtimev1alpha1.CacheStateLocalReady)},
-			},
-			wantNode: "node-b",
-		},
-		{
-			name: "skips non-LocalReady cacheState",
-			infos: []*types.SnapshotInfo{
-				{NodeName: "node-a", CacheState: string(runtimev1alpha1.CacheStateBuilding)},
-			},
-			wantNode: "",
-		},
-		{
-			name: "skips Unavailable cacheState",
-			infos: []*types.SnapshotInfo{
-				{NodeName: "node-a", CacheState: string(runtimev1alpha1.CacheStateUnavailable)},
-			},
-			wantNode: "",
-		},
-		{
-			name:     "empty list returns nil",
-			infos:    nil,
-			wantNode: "",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			nodeStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
-			// Pre-populate the node informer cache for all nodes referenced in infos.
-			for _, info := range tc.infos {
-				if info.CacheState == string(runtimev1alpha1.CacheStateLocalReady) {
-					require.NoError(t, nodeStore.Add(readyNode(info.NodeName)))
-				}
-			}
-			s := &Server{
-				informers: &Informers{
-					NodeInformer: &fakeSharedIndexInformer{testStore: nodeStore},
-				},
-			}
-			got := s.selectReadySnapshotNode(tc.infos)
-			if tc.wantNode == "" {
-				assert.Nil(t, got)
-			} else {
-				require.NotNil(t, got)
-				assert.Equal(t, tc.wantNode, got.NodeName)
-			}
-		})
-	}
-}
-
-// ---------------------------------------------------------------------------
-// filterSnapshotsByEligibleNodes
-// ---------------------------------------------------------------------------
-
-// TestFilterSnapshotsByEligibleNodes_ErrorReturnNil verifies that when
-// getEligibleNodesForCI fails (e.g. a transient RuntimeClass API error),
-// filterSnapshotsByEligibleNodes returns nil to force cold start rather than
-// allowing potentially ineligible placements through.
-func TestFilterSnapshotsByEligibleNodes_ErrorReturnNil(t *testing.T) {
-	cs := fake.NewSimpleClientset()
-	// Inject an error for any node list call so getEligibleNodes returns an error.
-	cs.PrependReactor("list", "nodes", func(_ k8stesting.Action) (bool, runtime.Object, error) {
-		return true, nil, errors.New("node API unavailable")
-	})
-	sc := &SnapshotController{clientset: cs}
-	s := &Server{snapshotController: sc}
-	ci := makeCI("img:v1", "", nil)
-	infos := []*types.SnapshotInfo{
-		{NodeName: "node-a"},
-	}
-	got := s.filterSnapshotsByEligibleNodes(context.Background(), infos, ci)
-	assert.Nil(t, got, "error fetching eligible nodes should fall back to cold start (nil result)")
-}
-
-// ---------------------------------------------------------------------------
-// shouldInvalidate
 // ---------------------------------------------------------------------------
 
 func makeSS(phase runtimev1alpha1.SnapshotPhase,

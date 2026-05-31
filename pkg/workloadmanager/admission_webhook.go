@@ -106,11 +106,6 @@ func (ah *admissionHandler) validateCreate(req *admissionv1.AdmissionRequest) *a
 		}
 	}
 
-	// Phase 1: SnapStartWarmPool is not yet implemented.
-	if ss.Spec.SnapStartWarmPool != nil && ss.Spec.SnapStartWarmPool.Enabled {
-		return admissionDenied("snapStartWarmPool.enabled=true is not supported in Phase 1; Kuasar VMM-layer warm pool will be available in Phase 2")
-	}
-
 	// Enforce uniqueness: at most one SnapStart per CodeInterpreter in a namespace.
 	existing := ah.indexer.getByRuntime(req.Namespace, ss.Spec.RuntimeRef.Name)
 	for _, e := range existing {
@@ -157,12 +152,6 @@ func (ah *admissionHandler) validateUpdate(req *admissionv1.AdmissionRequest) *a
 				"artifact.distribution=%s is not supported in Phase 1; only NodeLocal is available",
 				newSS.Spec.Artifact.Distribution))
 		}
-	}
-
-	// Phase 1: SnapStartWarmPool cannot be enabled via update either.
-	if newSS.Spec.SnapStartWarmPool != nil && newSS.Spec.SnapStartWarmPool.Enabled &&
-		(oldSS.Spec.SnapStartWarmPool == nil || !oldSS.Spec.SnapStartWarmPool.Enabled) {
-		return admissionDenied("snapStartWarmPool.enabled=true is not supported in Phase 1")
 	}
 
 	return admissionAllowed()

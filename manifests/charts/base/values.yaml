@@ -53,8 +53,11 @@ workloadmanager:
   extraEnv: []
   snapstartWebhook:
     # enabled controls whether the SnapStart ValidatingWebhookConfiguration is deployed.
-    # Requires webhook.port to be configured; set caBundle to the base64-encoded CA cert.
+    # Requires webhook.port to be configured.
     enabled: false
+    # caBundle: base64-encoded CA cert for the API server to verify the webhook server.
+    # Leave empty to use the Helm-generated self-signed CA (development only).
+    # For production, set this to the CA that signed the cert in webhook.tls.secretName.
     caBundle: ""
   # webhook configures the dedicated TLS-only admission webhook server.
   # When port is non-empty, a separate HTTPS listener is started for /validate/snapstart

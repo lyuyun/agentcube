@@ -53,6 +53,8 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
+	// AnnotationRestoredFromSnapshot is set by Kuasar after a successful restore.
+	// The branch below will fire once the Kuasar→AgentCube reporting channel is wired up.
 	if templateKey := sandbox.Annotations[agentcubetypes.AnnotationRestoredFromSnapshot]; templateKey != "" {
 		klog.V(2).Infof("Sandbox %s/%s restored from snapshot (key=%s), notifying waiter",
 			sandbox.Namespace, sandbox.Name, templateKey)

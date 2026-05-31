@@ -30,11 +30,17 @@ const (
 
 // Annotation and label constants for SnapStart feature.
 const (
-	// AnnotationSnapshotTemplateID is the annotation on a restore Sandbox CR that
-	// identifies the Kuasar WarmForkSnapshot template to restore from.
-	AnnotationSnapshotTemplateID = "agentcube.volcano.sh/snapshot-template-id"
+	// AnnotationSnapStartRef is the AgentCube-layer logical SnapStart intent set on a newly
+	// created direct Sandbox. Value is "<namespace>/<snapstart-name>". SandboxReconciler reads
+	// this and propagates the Kuasar-facing protocol annotations before Pod creation.
+	// Must never be set on SandboxClaim-bound Sandboxes (WarmPool hit path).
+	AnnotationSnapStartRef = "agentcube.volcano.sh/snapstart-ref"
+	// AnnotationSnapStartUID guards against stale intent after a SnapStart is deleted and
+	// recreated with the same name. Value is the UID of the owning SnapStart object.
+	AnnotationSnapStartUID = "agentcube.volcano.sh/snapstart-uid"
 	// AnnotationRestoredFromSnapshot records the template key of the snapshot that was used
-	// to restore this sandbox. Used for observability only.
+	// to restore this sandbox. Reserved for Kuasar to set after a successful restore;
+	// WM reads it for observability once the Kuasar→AgentCube reporting channel is wired up.
 	AnnotationRestoredFromSnapshot = "agentcube.volcano.sh/restored-from-snapshot"
 	// AnnotationTemplateSandbox marks a sandbox as a snapshot build sandbox (Job semantics).
 	// The sandbox is deleted after the snapshot is created.

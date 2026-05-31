@@ -2,10 +2,45 @@
 {{- if not .Values.workloadmanager.webhook.port }}
 {{- fail "snapstartWebhook.enabled=true requires workloadmanager.webhook.port to be set: Kubernetes admission webhooks require a dedicated TLS endpoint. Set webhook.port (e.g. '8443') and webhook.tls.secretName." }}
 {{- end }}
+{{- /*
+  Generate a self-signed CA and leaf cert once so the Secret and caBundle stay
+  consistent within a single Helm render.  Both resources below reuse $ca / $cert.
+
+  WARNING: Helm re-generates the cert on every `helm upgrade`, which causes the
+  Secret to change and triggers a Workload Manager pod restart.  This is acceptable
+  for development clusters.  For production, create the Secret and CA bundle manually
+  (e.g. with openssl or an internal PKI) and set snapstartWebhook.caBundle explicitly.
+*/}}
+{{- $svcFQDN   := printf "workloadmanager-webhook.%s.svc" .Release.Namespace }}
+{{- $selfSigned := not .Values.workloadmanager.snapstartWebhook.caBundle }}
+{{- $ca   := dict }}
+{{- $cert := dict }}
+{{- if $selfSigned }}
+{{- $caObj   := genCA "agentcube-snapstart-webhook-ca" 3650 }}
+{{- $certObj := genSignedCert $svcFQDN nil (list $svcFQDN (printf "%s.cluster.local" $svcFQDN)) 3650 $caObj }}
+{{- $_ := set $ca   "Cert" $caObj.Cert }}
+{{- $_ := set $cert "Cert" $certObj.Cert }}
+{{- $_ := set $cert "Key"  $certObj.Key }}
+---
+# TLS Secret for the webhook HTTPS server.
+# Helm-generated self-signed cert — only rendered when snapstartWebhook.caBundle is empty.
+# For production: pre-create this Secret with a cert signed by your own CA, then set
+# snapstartWebhook.caBundle to the base64-encoded CA cert; Helm will not overwrite it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.workloadmanager.webhook.tls.secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: workloadmanager
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ get $cert "Cert" | b64enc }}
+  tls.key: {{ get $cert "Key"  | b64enc }}
+{{- end }}
+---
 # Service to expose the dedicated webhook HTTPS port for SnapStart admission validation.
 # Routes port 443 → workloadmanager.webhook.port (e.g. 8443) on the Workload Manager pods.
-# Set caBundle to the base64-encoded CA certificate that signed the webhook TLS cert.
----
 apiVersion: v1
 kind: Service
 metadata:
@@ -23,17 +58,13 @@ spec:
   selector:
     app: workloadmanager
 ---
-# ValidatingWebhookConfiguration for SnapStart uniqueness enforcement.
-# Rejects:
-#  1. runtimeRef.kind=AgentRuntime (Phase 2 only; not yet implemented).
-#  2. A second SnapStart referencing the same CodeInterpreter in a namespace.
+# ValidatingWebhookConfiguration for SnapStart admission validation.
+# Enforces:
+#   1. runtimeRef.kind=AgentRuntime is rejected (Phase 2 only).
+#   2. At most one SnapStart per CodeInterpreter per namespace.
 #
-# NOTE: The webhook enforces uniqueness via an in-memory indexer in the Workload Manager.
-# Under a very narrow race window (two concurrent CREATE requests that both arrive before
-# either SnapStart is admitted and indexed), both may pass. The SnapshotController handles
-# this by detecting conflicts in the indexer and setting the duplicate to Failed.
-# A full cluster-level uniqueness guarantee requires a CRD-level CEL validation rule or a
-# separate leader-elected admission controller.
+# NOTE: uniqueness is enforced via an in-memory indexer; a narrow race window exists for
+# concurrent CREATE requests.  SnapshotController detects and fails duplicates.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
@@ -48,7 +79,11 @@ webhooks:
         namespace: {{ .Release.Namespace }}
         path: /validate/snapstart
         port: 443
+      {{- if $selfSigned }}
+      caBundle: {{ get $ca "Cert" | b64enc | quote }}
+      {{- else }}
       caBundle: {{ .Values.workloadmanager.snapstartWebhook.caBundle | quote }}
+      {{- end }}
     rules:
       - apiGroups:   ["runtime.agentcube.volcano.sh"]
         apiVersions: ["v1alpha1"]

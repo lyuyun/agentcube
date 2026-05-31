@@ -129,26 +129,6 @@ spec:
                 - kind
                 - name
                 type: object
-              snapStartWarmPool:
-                description: |-
-                  SnapStartWarmPool configures the Kuasar VMM-layer pre-restored sandbox pool.
-                  Optional, disabled by default. See Section 3.4 for distinction from spec.warmPoolSize.
-                properties:
-                  enabled:
-                    default: false
-                    description: Enabled activates the SnapStart warm pool. Default
-                      false.
-                    type: boolean
-                  size:
-                    default: 2
-                    description: Size is the target number of pre-restored ready sandboxes.
-                    format: int32
-                    maximum: 20
-                    minimum: 1
-                    type: integer
-                required:
-                - enabled
-                type: object
             required:
             - runtimeRef
             type: object

@@ -24,22 +24,21 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/volcano-sh/agentcube/pkg/api"
 	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
 	"github.com/volcano-sh/agentcube/pkg/common/types"
 	"github.com/volcano-sh/agentcube/pkg/store"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/controllers"
@@ -552,39 +551,27 @@ func TestHandleDeleteSandbox_DetachedContext(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// handleSandboxCreate restore gate branches
+// attachWorkloadSnapStartIntent
 // ---------------------------------------------------------------------------
 
-// TestHandleSandboxCreate_RestoreGateBranches verifies that the SnapStart status
-// checks (ActiveMode, published placements) correctly decide cold-start vs restore.
-// The observable signal is the forceDirectSandbox flag passed to buildSandboxByCodeInterpreter:
-//   - true  → restore path selected (readySnap != nil)
-//   - false → cold start
-func TestHandleSandboxCreate_RestoreGateBranches(t *testing.T) {
+// TestAttachWorkloadSnapStartIntent verifies that logical SnapStart intent is attached
+// to newly created direct Sandboxes, and that the version gate (filterSnapshotsByVersion)
+// correctly prevents stale Redis entries from being used during the SnapshotController
+// convergence window.
+func TestAttachWorkloadSnapStartIntent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// CI that will be returned by the informer.
+	// ci is the CodeInterpreter that the informer will return.
 	ci := makeCI("img:v1", "", nil)
 	ci.Namespace = "ns"
 	ci.Name = "workload"
 	specHash := computeSpecHashNoImage(ci)
 	templateKey := "fork:sha256-abc:InterpreterReady:" + specHash
+	ssUID := "uid-123"
 
-	// Snapshot info in Redis that matches the CI in all mandatory version fields.
-	snapInfo := &types.SnapshotInfo{
-		NodeName:        "node-a",
-		CacheState:      string(runtimev1alpha1.CacheStateLocalReady),
-		SpecHash:        specHash,
-		ImageRef:        "img:v1",
-		Checkpoint:      "InterpreterReady",
-		ProtocolVersion: "1",
-		TemplateKey:     templateKey,
-	}
-
-	// Helper: build a SnapStart with the given activeMode.
-	makeSnapStart := func(activeMode runtimev1alpha1.SessionStartupMode) *runtimev1alpha1.SnapStart {
+	makeSnapStart := func(activeMode runtimev1alpha1.SessionStartupMode, uid string) *runtimev1alpha1.SnapStart {
 		return &runtimev1alpha1.SnapStart{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ss-test"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ss-test", UID: k8stypes.UID(uid)},
 			Spec: runtimev1alpha1.SnapStartSpec{
 				RuntimeRef: runtimev1alpha1.RuntimeReference{Kind: "CodeInterpreter", Name: "workload"},
 				Checkpoint: "InterpreterReady",
@@ -593,114 +580,102 @@ func TestHandleSandboxCreate_RestoreGateBranches(t *testing.T) {
 		}
 	}
 
+	// validInfo is a LocalReady placement whose version fields match the current CI.
+	validInfo := &types.SnapshotInfo{
+		NodeName: "node-a", CacheState: string(runtimev1alpha1.CacheStateLocalReady),
+		SnapStartUID: ssUID, TemplateKey: templateKey,
+		SpecHash: specHash, ImageRef: "img:v1", Checkpoint: "InterpreterReady", ProtocolVersion: "1",
+	}
+
 	cases := []struct {
-		name        string
-		snapStarts  []*runtimev1alpha1.SnapStart
-		wantRestore bool
+		name            string
+		snapStarts      []*runtimev1alpha1.SnapStart
+		snapInfos       []*types.SnapshotInfo
+		wantRef         string // expected agentcube.volcano.sh/snapstart-ref; "" means absent
+		wantTemplateKey string // expected kuasar.io/template-key; "" means absent
 	}{
 		{
-			name:        "no SnapStart in indexer → cold start",
-			snapStarts:  nil,
-			wantRestore: false,
+			name:       "no SnapStart → no annotations",
+			snapStarts: nil,
 		},
 		{
-			name:        "SnapStart ActiveMode=Cold → cold start",
-			snapStarts:  []*runtimev1alpha1.SnapStart{makeSnapStart(runtimev1alpha1.SessionStartupModeCold)},
-			wantRestore: false,
+			name:       "SnapStart ActiveMode=Cold → no annotations",
+			snapStarts: []*runtimev1alpha1.SnapStart{makeSnapStart(runtimev1alpha1.SessionStartupModeCold, ssUID)},
 		},
 		{
-			name:        "SnapStart ActiveMode=Snapshot → restore from Redis",
-			snapStarts:  []*runtimev1alpha1.SnapStart{makeSnapStart(runtimev1alpha1.SessionStartupModeSnapshot)},
-			wantRestore: true,
+			name:       "SnapStart Snapshot but no LocalReady placement → no annotations",
+			snapStarts: []*runtimev1alpha1.SnapStart{makeSnapStart(runtimev1alpha1.SessionStartupModeSnapshot, ssUID)},
+			snapInfos: []*types.SnapshotInfo{
+				{NodeName: "node-a", CacheState: string(runtimev1alpha1.CacheStateBuilding), SnapStartUID: ssUID,
+					SpecHash: specHash, ImageRef: "img:v1", Checkpoint: "InterpreterReady", ProtocolVersion: "1"},
+			},
+		},
+		{
+			name:            "version-valid LocalReady placement → intent attached",
+			snapStarts:      []*runtimev1alpha1.SnapStart{makeSnapStart(runtimev1alpha1.SessionStartupModeSnapshot, ssUID)},
+			snapInfos:       []*types.SnapshotInfo{validInfo},
+			wantRef:         "ns/ss-test",
+			wantTemplateKey: templateKey,
+		},
+		{
+			name:       "stale SnapStartUID → no annotations",
+			snapStarts: []*runtimev1alpha1.SnapStart{makeSnapStart(runtimev1alpha1.SessionStartupModeSnapshot, ssUID)},
+			snapInfos: []*types.SnapshotInfo{
+				{NodeName: "node-a", CacheState: string(runtimev1alpha1.CacheStateLocalReady),
+					SnapStartUID: "old-uid", TemplateKey: templateKey,
+					SpecHash: specHash, ImageRef: "img:v1", Checkpoint: "InterpreterReady", ProtocolVersion: "1"},
+			},
+		},
+		{
+			// Simulates the SnapshotController convergence window: CI image was bumped but
+			// activeMode hasn't been set to Cold yet. The version gate must reject the stale entry.
+			name:       "version gate rejects stale specHash → no annotations",
+			snapStarts: []*runtimev1alpha1.SnapStart{makeSnapStart(runtimev1alpha1.SessionStartupModeSnapshot, ssUID)},
+			snapInfos: []*types.SnapshotInfo{
+				{NodeName: "node-a", CacheState: string(runtimev1alpha1.CacheStateLocalReady),
+					SnapStartUID: ssUID, TemplateKey: templateKey,
+					SpecHash: "old-hash", ImageRef: "img:v1", Checkpoint: "InterpreterReady", ProtocolVersion: "1"},
+			},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// CI informer: getCodeInterpreter looks up by "namespace/name".
 			ciStore := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 			require.NoError(t, ciStore.Add(ciToUnstructured(t, ci)))
 
-			// Node informer: selectReadySnapshotNode checks isNodeCurrentlyReady.
-			nodeStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
-			require.NoError(t, nodeStore.Add(&corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:   "node-a",
-					Labels: map[string]string{types.LabelKuasarSnapstart: "true"},
-				},
-				Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
-					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
-				}},
-			}))
-
-			// Fake clientset: getEligibleNodesForCI calls Nodes().List().
-			cs := fake.NewSimpleClientset(&corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:   "node-a",
-					Labels: map[string]string{types.LabelKuasarSnapstart: "true"},
-				},
-				Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
-					{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
-				}},
-			})
-
-			// SnapStart indexer: configured per test case.
 			idx := newSnapStartIndexer()
 			for _, ss := range tc.snapStarts {
 				idx.upsert(ss)
 			}
-
 			sc := &SnapshotController{
-				clientset: cs,
+				indexer: idx,
 				informers: &Informers{
 					CodeInterpreterInformer: &fakeSharedIndexInformer{testStore: ciStore},
 				},
-				indexer: idx,
 			}
-
-			// Store returns the pre-built snapshot info so the version gate has data to evaluate.
-			fakeStoreInst := &fakeStore{snapInfos: []*types.SnapshotInfo{snapInfo}}
+			fakeStoreInst := &fakeStore{snapInfos: tc.snapInfos}
 
 			server := &Server{
-				config:             &Config{SandboxReadyProbeTimeout: 5 * time.Millisecond, SandboxReadyProbeInterval: time.Millisecond},
-				k8sClient:          &K8sClient{},
-				sandboxController:  &SandboxReconciler{},
 				storeClient:        fakeStoreInst,
 				snapshotController: sc,
-				informers: &Informers{
-					NodeInformer: &fakeSharedIndexInformer{testStore: nodeStore},
-				},
 			}
 
-			var gotForceDirectSandbox bool
-			patches := gomonkey.NewPatches()
-			defer patches.Reset()
+			sb, entry := makeSandbox(types.CodeInterpreterKind, "ns", "workload")
+			server.attachWorkloadSnapStartIntent(context.Background(), sb, "ns", "workload", entry.SessionID)
 
-			patches.ApplyFunc(buildSandboxByCodeInterpreter,
-				func(_, _ string, _ *Informers, fds bool) (*sandboxv1alpha1.Sandbox, *extensionsv1alpha1.SandboxClaim, *sandboxEntry, error) {
-					gotForceDirectSandbox = fds
-					sb, entry := makeSandbox(types.CodeInterpreterKind, "ns", "workload")
-					return sb, &extensionsv1alpha1.SandboxClaim{
-						ObjectMeta: metav1.ObjectMeta{Name: sb.Name, Namespace: sb.Namespace},
-					}, entry, nil
-				})
-
-			patches.ApplyPrivateMethod(reflect.TypeOf(server), "createSandbox",
-				func(_ *Server, _ context.Context, _ dynamic.Interface, _ *sandboxv1alpha1.Sandbox, _ *extensionsv1alpha1.SandboxClaim, _ *sandboxEntry, _ <-chan SandboxStatusUpdate) (*types.CreateSandboxResponse, error) {
-					return &types.CreateSandboxResponse{SessionID: "sess-1"}, nil
-				})
-
-			w := httptest.NewRecorder()
-			c, _ := gin.CreateTestContext(w)
-			c.Request = httptest.NewRequest(http.MethodPost, "/",
-				strings.NewReader(`{"name":"workload","namespace":"ns"}`))
-			c.Request.Header.Set("Content-Type", "application/json")
-
-			server.handleSandboxCreate(c, types.CodeInterpreterKind)
-
-			require.Equal(t, http.StatusOK, w.Code, "expected 200 for test case %q", tc.name)
-			require.Equal(t, tc.wantRestore, gotForceDirectSandbox,
-				"forceDirectSandbox mismatch for case %q", tc.name)
+			if tc.wantRef == "" {
+				assert.Empty(t, sb.Annotations[types.AnnotationSnapStartRef],
+					"expected no snapstart-ref annotation")
+				assert.Empty(t, sb.Spec.PodTemplate.ObjectMeta.Annotations["kuasar.io/template-key"],
+					"expected no kuasar template-key annotation")
+			} else {
+				assert.Equal(t, tc.wantRef, sb.Annotations[types.AnnotationSnapStartRef])
+				assert.Equal(t, ssUID, sb.Annotations[types.AnnotationSnapStartUID])
+				assert.Equal(t, "warm-fork", sb.Spec.PodTemplate.ObjectMeta.Annotations["kuasar.io/snapshot-type"])
+				assert.Equal(t, tc.wantTemplateKey, sb.Spec.PodTemplate.ObjectMeta.Annotations["kuasar.io/template-key"])
+				assert.Equal(t, entry.SessionID, sb.Spec.PodTemplate.ObjectMeta.Annotations["kuasar.io/task-id"])
+			}
 		})
 	}
 }

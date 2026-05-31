@@ -115,11 +115,6 @@ type SnapStartSpec struct {
 	// +optional
 	Invalidation *SnapStartInvalidation `json:"invalidation,omitempty"`
 
-	// SnapStartWarmPool configures the Kuasar VMM-layer pre-restored sandbox pool.
-	// Optional, disabled by default. See Section 3.4 for distinction from spec.warmPoolSize.
-	// +optional
-	SnapStartWarmPool *SnapStartWarmPoolSpec `json:"snapStartWarmPool,omitempty"`
-
 	// Artifact configures snapshot artifact storage.
 	// Defaults to NodeLocal (Phase 1).
 	// +optional
@@ -155,22 +150,6 @@ type SnapStartInvalidation struct {
 	// MaxAge is the maximum lifetime of a snapshot.
 	// +kubebuilder:default="24h"
 	MaxAge *metav1.Duration `json:"maxAge,omitempty"`
-}
-
-// SnapStartWarmPoolSpec maintains pre-restored Kuasar sandboxes for sub-200ms session creation.
-// Operates at the Kuasar VMM layer (pre-restored from WarmForkSnapshot).
-// Distinct from CodeInterpreter.spec.warmPoolSize (K8s Pod layer, pre-created pods).
-// Warning: each warm slot continuously consumes runtime-level CPU and memory.
-// Enable only when snapshot restore latency (0.5–2s) is unacceptable.
-type SnapStartWarmPoolSpec struct {
-	// Enabled activates the SnapStart warm pool. Default false.
-	// +kubebuilder:default=false
-	Enabled bool `json:"enabled"`
-	// Size is the target number of pre-restored ready sandboxes.
-	// +kubebuilder:default=2
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=20
-	Size int32 `json:"size,omitempty"`
 }
 
 // SessionStartupMode is the effective startup path for new sessions.

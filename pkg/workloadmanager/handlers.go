@@ -90,74 +90,19 @@ func (s *Server) extractUserK8sClient(c *gin.Context) (dynamic.Interface, error)
 	return userClient.dynamicClient, nil
 }
 
-// selectReadySnapshotNode picks a per-node snapshot record that is usable for restore:
-//   - CacheState == LocalReady (Phase 1 NodeLocal requirement per design §6.3)
-//   - Node is currently Ready in the informer cache
-func (s *Server) selectReadySnapshotNode(infos []*types.SnapshotInfo) *types.SnapshotInfo {
-	for _, info := range infos {
-		if info.CacheState != string(runtimev1alpha1.CacheStateLocalReady) {
-			klog.V(3).Infof("selectReadySnapshotNode: node %s phase=Ready but cacheState=%s (want LocalReady); skipping",
-				info.NodeName, info.CacheState)
-			continue
-		}
-		if !s.isNodeCurrentlyReady(info.NodeName) {
-			klog.V(3).Infof("selectReadySnapshotNode: node %s has a Ready snapshot but node is not currently Ready; skipping",
-				info.NodeName)
-			continue
-		}
-		return info
+// isSessionSpecificEnv returns true for env vars that carry per-session identity and
+// must be injected via the WarmFork PREPARE message rather than being baked into the snapshot.
+func isSessionSpecificEnv(e corev1.EnvVar) bool {
+	switch e.Name {
+	case "PICOD_AUTH_PUBLIC_KEY":
+		return true
 	}
-	return nil
-}
-
-// isNodeCurrentlyReady returns true if the named node exists in the informer cache and is Ready.
-func (s *Server) isNodeCurrentlyReady(nodeName string) bool {
-	if s.informers.NodeInformer == nil {
-		return true // informer not available; assume Ready to avoid blocking restores
-	}
-	obj, exists, err := s.informers.NodeInformer.GetStore().GetByKey(nodeName)
-	if err != nil || !exists {
-		return false
-	}
-	node, ok := obj.(*corev1.Node)
-	if !ok {
-		return false
-	}
-	return isNodeReady(node)
-}
-
-// injectKuasarRestoreAnnotations adds WarmFork restore protocol annotations to the
-// sandbox PodTemplate so that Kuasar sandboxer performs snapshot restore on start.
-// These must be present before the Sandbox CR is submitted to the API server.
-func injectKuasarRestoreAnnotations(sandbox *sandboxv1alpha1.Sandbox, snap *types.SnapshotInfo, sessionID string) {
-	if sandbox.Spec.PodTemplate.ObjectMeta.Annotations == nil {
-		sandbox.Spec.PodTemplate.ObjectMeta.Annotations = make(map[string]string)
-	}
-	ann := sandbox.Spec.PodTemplate.ObjectMeta.Annotations
-
-	ann["kuasar.io/snapshot-type"] = "warm-fork"
-	ann["kuasar.io/template-key"] = snap.TemplateKey
-	ann["kuasar.io/task-id"] = sessionID
-
-	// Build task-context: workspace path is derived from sessionID.
-	taskCtxBytes, _ := json.Marshal(map[string]string{"workspace": "/workspace/" + sessionID})
-	ann["kuasar.io/task-context"] = string(taskCtxBytes)
-
-	// Propagate session-specific env overrides so picod's COMMIT handler can apply them.
-	// We collect only env vars that are not baked into the snapshot template.
-	for _, c := range sandbox.Spec.PodTemplate.Spec.Containers {
-		for _, e := range c.Env {
-			if isSessionSpecificEnv(e) {
-				ann["kuasar.io/task-env/"+e.Name] = e.Value
-			}
-		}
-	}
+	return false
 }
 
 // snapshotVersionGate holds the current runtime's version parameters used to validate
-// Redis snapshot entries before restore.
+// Redis snapshot entries before attaching restore intent.
 // All fields except RuntimeGeneration are mandatory (non-empty required).
-// Stale-generation entries are rejected upstream via SnapStartUID matching.
 type snapshotVersionGate struct {
 	SpecHash          string
 	ImageRef          string
@@ -166,13 +111,16 @@ type snapshotVersionGate struct {
 	RuntimeGeneration int64
 }
 
-// filterSnapshotsByVersion rejects Redis snapshot entries that do not match the current
-// runtime version or are missing mandatory version fields. Stale-generation entries are
-// already rejected upstream by SnapStartUID matching.
+// filterSnapshotsByVersion rejects Redis snapshot entries whose version fields do not
+// match the current runtime. This is a synchronous guard against the SnapshotController
+// convergence window: a CI spec update (image, args, resources) immediately makes old
+// Redis entries stale, but SnapshotController may not have set activeMode=Cold yet.
+// Without this check, attachWorkloadSnapStartIntent could attach a stale templateKey
+// built from an older runtime spec.
 //
 // Rejection rules:
-//  1. Any of SpecHash, ImageRef, Checkpoint, ProtocolVersion is empty → reject (pre-upgrade entry).
-//  2. SpecHash mismatch → reject (spec drift: args/env/resources/runtimeClass changed).
+//  1. Any mandatory field (SpecHash, ImageRef, Checkpoint, ProtocolVersion) is empty → reject.
+//  2. SpecHash mismatch → reject (args/env/resources/runtimeClass changed).
 //  3. ImageRef mismatch → reject (image reference changed).
 //  4. Checkpoint mismatch → reject.
 //  5. ProtocolVersion mismatch → reject.
@@ -215,41 +163,117 @@ func filterSnapshotsByVersion(infos []*types.SnapshotInfo, gate snapshotVersionG
 	return result
 }
 
-// filterSnapshotsByEligibleNodes returns only snapshot infos whose node satisfies the
-// current runtime's scheduling constraints (kuasar-snapstart label + runtimeClass nodeSelector).
-// On error, returns nil to force cold start — restoring to a node that may no longer satisfy
-// the runtime's scheduling constraints is unsafe, so we conservatively reject all placements.
-func (s *Server) filterSnapshotsByEligibleNodes(ctx context.Context, infos []*types.SnapshotInfo, ci *runtimev1alpha1.CodeInterpreter) []*types.SnapshotInfo {
-	eligible, err := s.snapshotController.getEligibleNodesForCI(ctx, ci)
+// attachWorkloadSnapStartIntent sets the AgentCube-layer logical SnapStart intent on a
+// newly created direct Sandbox and propagates the Kuasar-facing protocol annotations to
+// its PodTemplate. It must never be called for SandboxClaim-bound sandboxes (WarmPool
+// hit path) — those are already running and must not be restored again.
+//
+// If no SnapStart is active for this runtime, or version validation rejects all Redis
+// entries, the function returns without modifying the sandbox and it cold-starts normally.
+func (s *Server) attachWorkloadSnapStartIntent(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox, namespace, ciName, sessionID string) {
+	if s.snapshotController == nil || s.storeClient == nil {
+		return
+	}
+	snapStarts := s.snapshotController.indexer.getByRuntime(namespace, ciName)
+	if len(snapStarts) == 0 {
+		return
+	}
+	ss := snapStarts[0]
+	if ss.Status.ActiveMode != runtimev1alpha1.SessionStartupModeSnapshot {
+		klog.V(3).Infof("attachWorkloadSnapStartIntent: SnapStart %s/%s activeMode=%s; skipping",
+			namespace, ss.Name, ss.Status.ActiveMode)
+		return
+	}
+
+	snapInfos, err := s.storeClient.GetSnapshotNodes(ctx, namespace, ss.Name)
 	if err != nil {
-		klog.Warningf("filterSnapshotsByEligibleNodes: cannot determine eligible nodes for %s/%s: %v; falling back to cold start",
-			ci.Namespace, ci.Name, err)
-		return nil
+		klog.Warningf("attachWorkloadSnapStartIntent: GetSnapshotNodes %s/%s failed; skipping: %v",
+			namespace, ss.Name, err)
+		return
 	}
-	eligibleSet := make(map[string]bool, len(eligible))
-	for _, n := range eligible {
-		eligibleSet[n.Name] = true
-	}
-	var result []*types.SnapshotInfo
-	for _, info := range infos {
-		if eligibleSet[info.NodeName] {
-			result = append(result, info)
-		} else {
-			klog.V(3).Infof("filterSnapshotsByEligibleNodes: node %s not eligible for %s/%s; skipping",
-				info.NodeName, ci.Namespace, ci.Name)
+
+	// Reject entries whose SnapStartUID doesn't match the current SnapStart.
+	var current []*types.SnapshotInfo
+	for _, info := range snapInfos {
+		if info.SnapStartUID == string(ss.UID) {
+			current = append(current, info)
 		}
 	}
-	return result
-}
 
-// isSessionSpecificEnv returns true for env vars that carry per-session identity and
-// must be injected via the WarmFork PREPARE message rather than being baked into the snapshot.
-func isSessionSpecificEnv(e corev1.EnvVar) bool {
-	switch e.Name {
-	case "PICOD_AUTH_PUBLIC_KEY":
-		return true
+	// Guard against the SnapshotController convergence window: a CI spec update makes
+	// old Redis entries stale immediately, but activeMode may not have been set to Cold
+	// yet. filterSnapshotsByVersion rejects any entry whose build inputs no longer match
+	// the current runtime, preventing restore from a mismatched snapshot template.
+	ci, ciErr := s.snapshotController.getCodeInterpreter(namespace, ciName)
+	if ciErr != nil {
+		klog.Warningf("attachWorkloadSnapStartIntent: cannot get CI %s/%s for version gating; skipping: %v",
+			namespace, ciName, ciErr)
+		return
 	}
-	return false
+	checkpoint := ss.Spec.Checkpoint
+	if checkpoint == "" {
+		checkpoint = "InterpreterReady"
+	}
+	gate := snapshotVersionGate{
+		SpecHash:          computeSpecHashNoImage(ci),
+		ImageRef:          ci.Spec.Template.Image,
+		Checkpoint:        checkpoint,
+		ProtocolVersion:   "1",
+		RuntimeGeneration: ci.Generation,
+	}
+	current = filterSnapshotsByVersion(current, gate)
+
+	// Get the templateKey from any LocalReady placement. All LocalReady placements for the
+	// same logical artifact carry the same templateKey; WM does not select a specific node.
+	// Kuasar resolves the templateKey → node-local template ID on the actual startup node.
+	var templateKey string
+	for _, info := range current {
+		if info.CacheState == string(runtimev1alpha1.CacheStateLocalReady) {
+			templateKey = info.TemplateKey
+			break
+		}
+	}
+	if templateKey == "" {
+		klog.V(3).Infof("attachWorkloadSnapStartIntent: no version-valid LocalReady placement for %s/%s; skipping",
+			namespace, ss.Name)
+		return
+	}
+
+	// AgentCube-layer logical intent on the Sandbox ObjectMeta.
+	if sandbox.Annotations == nil {
+		sandbox.Annotations = make(map[string]string)
+	}
+	sandbox.Annotations[types.AnnotationSnapStartRef] = namespace + "/" + ss.Name
+	sandbox.Annotations[types.AnnotationSnapStartUID] = string(ss.UID)
+
+	// Kuasar-facing protocol annotations on the PodTemplate.
+	// These annotations rely on two unverified Kuasar contracts (Issue 6):
+	//   1. kuasar.io/template-key is resolved to a node-local template ID by Kuasar at
+	//      startup time; WM must not embed a node-local template_id or force a restore node.
+	//   2. When no compatible local template exists, Kuasar cold-starts the same Sandbox
+	//      transparently rather than failing it (confirmed by maintainers, no contract test yet).
+	if sandbox.Spec.PodTemplate.ObjectMeta.Annotations == nil {
+		sandbox.Spec.PodTemplate.ObjectMeta.Annotations = make(map[string]string)
+	}
+	ann := sandbox.Spec.PodTemplate.ObjectMeta.Annotations
+	ann["kuasar.io/snapshot-type"] = "warm-fork"
+	ann["kuasar.io/template-key"] = templateKey
+	ann["kuasar.io/task-id"] = sessionID
+	// TODO(lyuyun): propagate a per-sandbox restore-failure policy annotation to Kuasar
+	// once the Kuasar annotation key/value contract is confirmed. This will allow
+	// SnapStart.spec.onRestoreFailure (ColdStart|Fail) to override the Kuasar global switch.
+	taskCtxBytes, _ := json.Marshal(map[string]string{"workspace": "/workspace/" + sessionID})
+	ann["kuasar.io/task-context"] = string(taskCtxBytes)
+	for _, c := range sandbox.Spec.PodTemplate.Spec.Containers {
+		for _, e := range c.Env {
+			if isSessionSpecificEnv(e) {
+				ann["kuasar.io/task-env/"+e.Name] = e.Value
+			}
+		}
+	}
+
+	klog.V(2).Infof("attachWorkloadSnapStartIntent: attached SnapStart intent %s/%s (templateKey=%s) to sandbox %s/%s",
+		namespace, ss.Name, templateKey, sandbox.Namespace, sandbox.Name)
 }
 
 // handleSandboxCreate handles sandbox creation given a specific kind.
@@ -269,85 +293,6 @@ func (s *Server) handleSandboxCreate(c *gin.Context, kind string) {
 		return
 	}
 
-	// Query snapshot availability for CodeInterpreter (before building sandbox object).
-	// forceDirectSandbox=true bypasses WarmPool SandboxClaim so we can bind nodeName.
-	// SnapStart indexer is checked first; Redis is only queried when activeMode=Snapshot.
-	// Redis key is the SnapStart name (not the runtime name) to prevent stale data after
-	// delete/recreate of a SnapStart object.
-	var readySnap *types.SnapshotInfo
-	if kind == types.CodeInterpreterKind && s.snapshotController != nil {
-		snapStarts := s.snapshotController.indexer.getByRuntime(sandboxReq.Namespace, sandboxReq.Name)
-		if len(snapStarts) == 0 {
-			klog.V(3).Infof("handleSandboxCreate: no SnapStart found for %s/%s; cold start",
-				sandboxReq.Namespace, sandboxReq.Name)
-		} else {
-			ss := snapStarts[0]
-			// ActiveMode is the authoritative restore gate set by SnapshotController.
-			if ss.Status.ActiveMode != runtimev1alpha1.SessionStartupModeSnapshot {
-				klog.V(3).Infof("handleSandboxCreate: SnapStart for %s/%s activeMode=%s; falling back to cold start",
-					sandboxReq.Namespace, sandboxReq.Name, ss.Status.ActiveMode)
-			} else {
-				snapInfos, snapErr := s.storeClient.GetSnapshotNodes(c.Request.Context(), sandboxReq.Namespace, ss.Name)
-				if snapErr != nil {
-					klog.Warningf("handleSandboxCreate: GetSnapshotNodes %s/%s failed (falling back to cold start): %v",
-						sandboxReq.Namespace, ss.Name, snapErr)
-				} else if len(snapInfos) > 0 {
-					// Reject entries whose SnapStartUID doesn't match the current SnapStart UID.
-					// This prevents restore from stale data left by a prior delete/recreate cycle.
-					// Entries with empty UID (built before UID tracking) are always rejected
-					// to avoid reusing data of unknown provenance.
-					var current []*types.SnapshotInfo
-					for _, info := range snapInfos {
-						if info.SnapStartUID == string(ss.UID) {
-							current = append(current, info)
-						}
-					}
-					ci, ciErr := s.snapshotController.getCodeInterpreter(sandboxReq.Namespace, sandboxReq.Name)
-					if ciErr != nil {
-						klog.Warningf("handleSandboxCreate: cannot get CI %s/%s for version gating, skipping snapshot: %v",
-							sandboxReq.Namespace, sandboxReq.Name, ciErr)
-					} else {
-						checkpoint := ss.Spec.Checkpoint
-						if checkpoint == "" {
-							checkpoint = "InterpreterReady"
-						}
-						gate := snapshotVersionGate{
-							SpecHash:          computeSpecHashNoImage(ci),
-							ImageRef:          ci.Spec.Template.Image,
-							Checkpoint:        checkpoint,
-							ProtocolVersion:   "1",
-							RuntimeGeneration: ci.Generation,
-						}
-						current = filterSnapshotsByVersion(current, gate)
-						current = s.filterSnapshotsByEligibleNodes(c.Request.Context(), current, ci)
-						readySnap = s.selectReadySnapshotNode(current)
-					}
-				}
-			}
-		}
-	}
-
-	// SAR pre-check for snapshot path: when a snapshot is available it forces "sandboxes/create"
-	// (bypassing the warm-pool SandboxClaim). If the user lacks that permission, treat the
-	// snapshot as unavailable and fall back to the cold/warm path, where the SAR will be
-	// re-evaluated against the actual resource being created (sandboxclaims or sandboxes).
-	if readySnap != nil && s.config.EnableAuth {
-		preCheckClient, clientErr := s.extractUserK8sClient(c)
-		if clientErr != nil {
-			respondError(c, http.StatusUnauthorized, clientErr.Error())
-			return
-		}
-		if sarErr := s.checkResourceCreatePermission(c.Request.Context(), preCheckClient,
-			sandboxReq.Namespace, "sandboxes"); sarErr != nil {
-			klog.Infof("handleSandboxCreate: SAR denied sandboxes/create for %s/%s; "+
-				"treating snapshot as unavailable and falling back to cold/warm: %v",
-				sandboxReq.Namespace, sandboxReq.Name, sarErr)
-			readySnap = nil
-		}
-	}
-
-	forceDirectSandbox := readySnap != nil
-
 	var sandbox *sandboxv1alpha1.Sandbox
 	var sandboxClaim *extensionsv1alpha1.SandboxClaim
 	var sandboxEntry *sandboxEntry
@@ -356,7 +301,7 @@ func (s *Server) handleSandboxCreate(c *gin.Context, kind string) {
 	case types.AgentRuntimeKind:
 		sandbox, sandboxEntry, err = buildSandboxByAgentRuntime(sandboxReq.Namespace, sandboxReq.Name, s.informers)
 	case types.CodeInterpreterKind:
-		sandbox, sandboxClaim, sandboxEntry, err = buildSandboxByCodeInterpreter(sandboxReq.Namespace, sandboxReq.Name, s.informers, forceDirectSandbox)
+		sandbox, sandboxClaim, sandboxEntry, err = buildSandboxByCodeInterpreter(sandboxReq.Namespace, sandboxReq.Name, s.informers)
 	}
 
 	if err != nil {
@@ -369,29 +314,20 @@ func (s *Server) handleSandboxCreate(c *gin.Context, kind string) {
 		return
 	}
 
-	// Track restore attempt for metrics.
-	if readySnap != nil {
-		snapshotRestoreTotal.WithLabelValues(sandboxReq.Namespace, sandboxReq.Name, "attempted").Inc()
+	// Attach logical SnapStart intent to newly created direct Sandboxes only.
+	// SandboxClaim-bound sandboxes (WarmPool hit) are already running — Kuasar has
+	// already started them and must not be asked to restore again.
+	// SnapStart and SandboxWarmPool are orthogonal: WarmPool refill Sandboxes receive
+	// SnapStart intent too (created as direct Sandboxes by the refill controller).
+	//
+	// snapStartIntentAttached records whether a restore was attempted so the failure
+	// counter can be incremented or reset on the outcome path below.
+	var snapStartIntentAttached bool
+	if kind == types.CodeInterpreterKind && sandboxClaim == nil {
+		s.attachWorkloadSnapStartIntent(c.Request.Context(), sandbox, sandboxReq.Namespace, sandboxReq.Name, sandboxEntry.SessionID)
+		snapStartIntentAttached = sandbox.Annotations[types.AnnotationSnapStartRef] != ""
 	}
 
-	// Inject snapshot annotations when a ready snapshot is available.
-	if readySnap != nil {
-		if sandbox.Annotations == nil {
-			sandbox.Annotations = make(map[string]string)
-		}
-		// AgentCube-layer annotations: restore identity + observability.
-		sandbox.Annotations[types.AnnotationSnapshotTemplateID] = readySnap.TemplateID
-		sandbox.Annotations[types.AnnotationRestoredFromSnapshot] = readySnap.TemplateKey
-		// Bind the sandbox to the node that holds the snapshot (snapshot is node-local).
-		sandbox.Spec.PodTemplate.Spec.NodeName = readySnap.NodeName
-		// Kuasar protocol annotations: must be in PodTemplate before Sandbox CR creation
-		// so the sandboxer sees them when it starts the VM and sends PREPARE.
-		injectKuasarRestoreAnnotations(sandbox, readySnap, sandboxEntry.SessionID)
-		klog.Infof("handleSandboxCreate: using snapshot template %s on node %s for %s/%s",
-			readySnap.TemplateID, readySnap.NodeName, sandboxReq.Namespace, sandboxReq.Name)
-	}
-
-	// Calculate sandbox name and namespace before creating
 	sandboxName := sandbox.Name
 	namespace := sandbox.Namespace
 
@@ -405,11 +341,8 @@ func (s *Server) handleSandboxCreate(c *gin.Context, kind string) {
 		}
 		dynamicClient = userDynamicClient
 
-		// Issue 9: Explicit SAR — determine the actual resource type first (based on snapshot
-		// availability), then check create permission for that exact type so the SAR resource
-		// matches what will actually be created.
 		sarResource := "sandboxclaims"
-		if forceDirectSandbox || sandboxClaim == nil {
+		if sandboxClaim == nil {
 			sarResource = "sandboxes"
 		}
 		if sarErr := s.checkResourceCreatePermission(c.Request.Context(), userDynamicClient,
@@ -423,59 +356,26 @@ func (s *Server) handleSandboxCreate(c *gin.Context, kind string) {
 	// CRITICAL: Register watcher BEFORE creating sandbox
 	// This ensures we don't miss the Running state notification
 	resultChan := s.sandboxController.WatchSandboxOnce(c.Request.Context(), namespace, sandboxName)
-	// Ensure cleanup is called when function returns to prevent memory leak
 	defer s.sandboxController.UnWatchSandbox(namespace, sandboxName)
 
 	response, err := s.createSandbox(c.Request.Context(), dynamicClient, sandbox, sandboxClaim, sandboxEntry, resultChan)
-	if err != nil && readySnap != nil {
-		snapshotRestoreTotal.WithLabelValues(sandboxReq.Namespace, sandboxReq.Name, "failure").Inc()
-		// Snapshot restore failed — increment the failure counter on the SnapStart object so
-		// SnapshotController can trigger Invalidated + rebuild after 3 consecutive failures.
-		// This is best-effort: a PATCH failure here is non-fatal (fallback still proceeds).
-		if incrErr := s.incrementRestoreFailureCount(c.Request.Context(), sandboxReq.Namespace, sandboxReq.Name); incrErr != nil {
-			klog.Warningf("handleSandboxCreate: failed to increment restoreFailureCount for %s/%s: %v",
-				sandboxReq.Namespace, sandboxReq.Name, incrErr)
-		}
-
-		// Fallback to cold start. Clear readySnap so that success metrics and events
-		// are not attributed to a snapshot restore that actually failed.
-		s.emitSnapStartWarning(sandboxReq.Namespace, sandboxReq.Name, "SandboxRestoreFallback",
-			"snapshot restore failed for %s/%s; falling back to cold start: %v",
-			sandboxReq.Namespace, sandboxReq.Name, err)
-		klog.Warningf("snapshot restore failed for %s/%s, falling back to cold start: %v",
-			sandboxReq.Namespace, sandboxReq.Name, err)
-		readySnap = nil
-		sandbox, sandboxClaim, sandboxEntry, err = buildSandboxByCodeInterpreter(sandboxReq.Namespace, sandboxReq.Name, s.informers, false)
-		if err == nil {
-			sandboxName = sandbox.Name
-			namespace = sandbox.Namespace
-			resultChan2 := s.sandboxController.WatchSandboxOnce(c.Request.Context(), namespace, sandboxName)
-			defer s.sandboxController.UnWatchSandbox(namespace, sandboxName)
-			response, err = s.createSandbox(c.Request.Context(), dynamicClient, sandbox, sandboxClaim, sandboxEntry, resultChan2)
-		}
-	}
 	if err != nil {
-		// Client disconnected — abort with 499 so logs/metrics reflect the cancellation.
 		if errors.Is(err, context.Canceled) {
 			klog.Warningf("create sandbox aborted %s/%s: client disconnected", sandbox.Namespace, sandbox.Name)
 			c.AbortWithStatus(499)
 			return
 		}
-		// Deadline exceeded — client may still be connected; return 504 so they get a meaningful response.
 		if errors.Is(err, context.DeadlineExceeded) {
 			klog.Warningf("create sandbox timed out %s/%s: request deadline exceeded", sandbox.Namespace, sandbox.Name)
 			respondError(c, http.StatusGatewayTimeout, "request timed out")
 			return
 		}
-		// Internal sandbox-ready wait timed out; surface as 504 rather than a generic 500.
 		if errors.Is(err, errSandboxCreationTimeout) {
 			klog.Warningf("create sandbox timed out %s/%s: sandbox did not become ready within deadline", sandbox.Namespace, sandbox.Name)
 			respondError(c, http.StatusGatewayTimeout, err.Error())
 			return
 		}
 		klog.Errorf("create sandbox failed %s/%s: %v", sandbox.Namespace, sandbox.Name, err)
-		// Internal errors (store, K8s API) must not leak system details to callers;
-		// sandbox-level failures (terminal pod state, timeout) are safe to surface.
 		msg := err.Error()
 		if apierrors.IsInternalError(err) {
 			msg = "internal server error"
@@ -484,19 +384,18 @@ func (s *Server) handleSandboxCreate(c *gin.Context, kind string) {
 		return
 	}
 
-	if readySnap != nil {
-		snapshotRestoreTotal.WithLabelValues(sandboxReq.Namespace, sandboxReq.Name, "success").Inc()
-		if resetErr := s.resetRestoreFailureCount(c.Request.Context(), sandboxReq.Namespace, sandboxReq.Name); resetErr != nil {
-			klog.Warningf("handleSandboxCreate: failed to reset restoreFailureCount for %s/%s: %v",
-				sandboxReq.Namespace, sandboxReq.Name, resetErr)
-		}
-		s.emitSnapStartEvent(sandboxReq.Namespace, sandboxReq.Name, "SandboxRestoredFromSnapshot",
-			"sandbox restored from WarmForkSnapshot template %s on node %s",
-			readySnap.TemplateKey, readySnap.NodeName)
-	}
+	// TODO(lyuyun): wire up incrementRestoreFailureCount / resetRestoreFailureCount and
+	// emit SandboxRestoredFromSnapshot / SandboxRestoreFallback events once Kuasar reports
+	// restore results (restored / cold_start_fallback / failure) back to AgentCube.
+	// WM cannot distinguish these outcomes from Sandbox readiness state alone.
+	_ = snapStartIntentAttached
+
 	respondJSON(c, http.StatusOK, response)
 }
 
+// resetRestoreFailureCount resets SnapStart.status.snapshot.restoreFailureCount to 0
+// on a successful session creation so transient failures do not accumulate toward the
+// rebuild threshold.
 func (s *Server) resetRestoreFailureCount(ctx context.Context, namespace, runtimeName string) error {
 	snapStarts := s.snapshotController.indexer.getByRuntime(namespace, runtimeName)
 	if len(snapStarts) == 0 || snapStarts[0].Status.Snapshot == nil ||
