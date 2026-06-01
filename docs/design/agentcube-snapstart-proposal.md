@@ -608,7 +608,9 @@ Fields intentionally excluded from `spec_hash`: labels, annotations, `imagePullS
 
 `args` must preserve order and must not be sorted. CLI arguments have ordering semantics; for example, `--preload=numpy,pandas` and `--preload=pandas,numpy` can produce different import order and different process memory. Sorting args during hash computation could map different runtime semantics to the same key and reuse a polluted snapshot.
 
-For tagged images, the build sandbox should use `imagePullPolicy: Always` so the controller can observe the resolved image digest. For digest-pinned images, `IfNotPresent` is allowed.
+The build sandbox uses the `imagePullPolicy` configured in `CodeInterpreter.spec.template` without modification. The controller reads the resolved image digest from `pod.status.containerStatuses[].imageID` after the container starts; this field is populated by the kubelet regardless of pull policy and always reflects the digest of the image that was actually used.
+
+For production deployments, images should be pinned to a digest (`image@sha256:...`) or use an immutable tag so that the snapshot is deterministically tied to a specific image version. Upgrading an image should be done by changing the tag or digest in the spec. Reusing the same mutable tag to point to a different digest is unsupported: behavior depends on the node-local image cache and the configured pull policy, and may result in a stale snapshot being used until a rebuild is triggered.
 
 `templateKey` is also the restore-time version gate. SnapshotController writes the key and its build inputs into placement metadata and publishes the current logical artifact version through the Kuasar-facing template-discovery contract. Because the final key includes the resolved image digest that is only known after a build Pod runs, the restore selector validates the stored full `templateKey` and the pre-resolved inputs (`runtimeSpecHash`, checkpoint, protocol version, and runtime generation). A placement whose version does not match the currently published logical artifact version is unavailable, even if its placement phase is still `Ready`.
 
