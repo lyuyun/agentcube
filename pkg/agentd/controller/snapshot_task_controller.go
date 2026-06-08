@@ -14,38 +14,46 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package agentd
+// Package controller implements the node-agent side of the snapshot build path.
+// It watches SandboxSnapshotTask objects assigned to this node and drives
+// snapshot creation through registered SnapshotDrivers.
+package controller
 
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
+	agentdriver "github.com/volcano-sh/agentcube/pkg/agentd/driver"
 	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
 )
 
-// SnapshotTaskReconciler watches SandboxSnapshotTask objects assigned to this node
+// taskBuildDeadline is the maximum time a SandboxSnapshotTask may remain
+// in a non-terminal phase before the node agent marks it Failed.
+const taskBuildDeadline = 10 * time.Minute
+
+// SnapshotTaskController watches SandboxSnapshotTask objects assigned to this node
 // and drives snapshot creation via the registered SnapshotDriver.
-// Mode-specific target validation is delegated to the registered SnapshotModeTaskHandler.
-type SnapshotTaskReconciler struct {
+type SnapshotTaskController struct {
 	client.Client
-	Scheme       *runtime.Scheme
-	NodeName     string
-	Drivers      map[string]SnapshotDriver
-	ModeHandlers map[runtimev1alpha1.SandboxSnapshotMode]SnapshotModeTaskHandler
+	Scheme   *runtime.Scheme
+	NodeName string
+	Drivers  map[string]agentdriver.SnapshotDriver
 }
 
-func (r *SnapshotTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *SnapshotTaskController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	task := &runtimev1alpha1.SandboxSnapshotTask{}
@@ -60,11 +68,18 @@ func (r *SnapshotTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Skip tasks that have already reached a terminal phase.
 	if task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseReady ||
-		task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseFailed {
+		task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseFailed ||
+		task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseUnavailable {
 		return ctrl.Result{}, nil
 	}
 
-	if done, err := r.validateSnapshotOwner(ctx, task); done || err != nil {
+	// Enforce an absolute build deadline to prevent hung tasks.
+	if !task.CreationTimestamp.IsZero() && time.Since(task.CreationTimestamp.Time) > taskBuildDeadline {
+		return r.reportFailed(ctx, task, fmt.Sprintf("snapshot build deadline exceeded (%s)", taskBuildDeadline))
+	}
+
+	// Validate required task fields (design §14 point 5).
+	if done, err := r.validateTask(ctx, task); done || err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -76,7 +91,7 @@ func (r *SnapshotTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Validate driver capabilities.
 	caps := driver.Capabilities(ctx)
-	if !containsSnapshotMode(caps.SnapshotModes, task.Spec.SnapshotMode) {
+	if !containsMode(caps.SnapshotModes, task.Spec.SnapshotMode) {
 		return r.reportFailed(ctx, task, fmt.Sprintf("driver does not support snapshot mode %q", task.Spec.SnapshotMode))
 	}
 
@@ -86,7 +101,7 @@ func (r *SnapshotTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	logger.Info("calling snapshot driver", "task", task.Name, "provider", task.Spec.ProviderName)
 
-	artifact, err := driver.Create(ctx, SnapshotDriverCreateRequest{
+	artifact, err := driver.Create(ctx, agentdriver.SnapshotDriverCreateRequest{
 		TaskRef: corev1.ObjectReference{
 			APIVersion: runtimev1alpha1.GroupVersion.String(),
 			Kind:       "SandboxSnapshotTask",
@@ -110,41 +125,46 @@ func (r *SnapshotTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return r.reportReady(ctx, task)
 }
 
-func (r *SnapshotTaskReconciler) validateSnapshotOwner(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask) (bool, error) {
+// validateTask checks that required task fields are present (design §14 point 5).
+// Target node and driver are validated separately in Reconcile; stale-task safety
+// is provided by ownerReference cascade deletion, not by re-fetching the snapshot.
+func (r *SnapshotTaskController) validateTask(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask) (bool, error) {
 	logger := log.FromContext(ctx)
-	snapshot := &runtimev1alpha1.SandboxSnapshot{}
-	if err := r.Get(ctx, types.NamespacedName{Name: task.Spec.SnapshotRef.Name, Namespace: task.Namespace}, snapshot); err != nil {
-		if apierrors.IsNotFound(err) {
-			logger.Info("owning snapshot not found, skipping task", "task", task.Name)
-			return true, nil
-		}
-		return true, err
-	}
-	if snapshot.UID != task.Spec.SnapshotUID {
-		logger.Info("snapshot UID mismatch, skipping stale task", "task", task.Name)
+	if task.Spec.SnapshotUID == "" || task.Spec.SnapshotKey == "" || task.Spec.SnapshotHash == "" {
+		logger.Info("task missing required fields, skipping", "task", task.Name)
 		return true, nil
 	}
 	return false, nil
 }
 
-func (r *SnapshotTaskReconciler) validateTargetSandbox(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask) (ctrl.Result, bool, error) {
-	handler, ok := r.ModeHandlers[task.Spec.SnapshotMode]
-	if !ok {
-		result, err := r.reportFailed(ctx, task, fmt.Sprintf("unsupported snapshot mode %q", task.Spec.SnapshotMode))
-		return result, true, err
+// validateTargetSandbox waits until the target Sandbox has the Ready condition before
+// allowing the driver to proceed. All snapshot modes require a running sandbox.
+func (r *SnapshotTaskController) validateTargetSandbox(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask) (ctrl.Result, bool, error) {
+	sandbox := &sandboxv1alpha1.Sandbox{}
+	err := r.Get(ctx, types.NamespacedName{Name: task.Spec.TargetSandboxRef.Name, Namespace: task.Namespace}, sandbox)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+		}
+		return ctrl.Result{}, true, fmt.Errorf("get sandbox %s/%s: %w", task.Namespace, task.Spec.TargetSandboxRef.Name, err)
 	}
-	return handler.ValidateTarget(ctx, task)
+	for _, cond := range sandbox.Status.Conditions {
+		if cond.Type == string(sandboxv1alpha1.SandboxConditionReady) && cond.Status == metav1.ConditionTrue {
+			return ctrl.Result{}, false, nil
+		}
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
 }
 
-func (r *SnapshotTaskReconciler) reportReady(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask) (ctrl.Result, error) {
+func (r *SnapshotTaskController) reportReady(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask) (ctrl.Result, error) {
 	return ctrl.Result{}, r.patchTaskStatus(ctx, task, runtimev1alpha1.SnapshotArtifactPhaseReady, "")
 }
 
-func (r *SnapshotTaskReconciler) reportFailed(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask, msg string) (ctrl.Result, error) {
+func (r *SnapshotTaskController) reportFailed(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask, msg string) (ctrl.Result, error) {
 	return ctrl.Result{}, r.patchTaskStatus(ctx, task, runtimev1alpha1.SnapshotArtifactPhaseFailed, msg)
 }
 
-func (r *SnapshotTaskReconciler) patchTaskStatus(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask, phase runtimev1alpha1.SnapshotArtifactPhase, msg string) error {
+func (r *SnapshotTaskController) patchTaskStatus(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask, phase runtimev1alpha1.SnapshotArtifactPhase, msg string) error {
 	patch := client.MergeFrom(task.DeepCopy())
 	now := metav1.Now()
 	task.Status.Phase = phase
@@ -153,7 +173,7 @@ func (r *SnapshotTaskReconciler) patchTaskStatus(ctx context.Context, task *runt
 	return r.Status().Patch(ctx, task, patch)
 }
 
-func containsSnapshotMode(modes []runtimev1alpha1.SandboxSnapshotMode, mode runtimev1alpha1.SandboxSnapshotMode) bool {
+func containsMode(modes []runtimev1alpha1.SandboxSnapshotMode, mode runtimev1alpha1.SandboxSnapshotMode) bool {
 	for _, m := range modes {
 		if m == mode {
 			return true
@@ -162,12 +182,8 @@ func containsSnapshotMode(modes []runtimev1alpha1.SandboxSnapshotMode, mode runt
 	return false
 }
 
-// SetupWithManager registers the controller and initializes mode handlers.
-func (r *SnapshotTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.ModeHandlers = map[runtimev1alpha1.SandboxSnapshotMode]SnapshotModeTaskHandler{
-		runtimev1alpha1.SandboxSnapshotModeFork: &ForkModeTaskHandler{Client: r.Client},
-	}
-
+// SetupWithManager registers the controller with the Manager.
+func (r *SnapshotTaskController) SetupWithManager(mgr ctrl.Manager) error {
 	nodeFilter := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		task, ok := obj.(*runtimev1alpha1.SandboxSnapshotTask)
 		if !ok {

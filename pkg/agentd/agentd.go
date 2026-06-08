@@ -29,7 +29,10 @@ import (
 	"github.com/volcano-sh/agentcube/pkg/workloadmanager"
 )
 
-// Reconciler reconciles a Sandbox object
+// Reconciler reconciles a Sandbox object for TTL/idle-timeout garbage collection.
+// Snapshot restore is handled by the runtime compatibility layer (CRI shim / VMM)
+// that reads the agentcube.volcano.sh/snapshot-key annotation during Pod sandbox
+// creation; the node agent is not involved in the restore path (design §7.6).
 type Reconciler struct {
 	client.Client
 	Scheme *runtime.Scheme

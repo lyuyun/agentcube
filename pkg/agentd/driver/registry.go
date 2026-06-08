@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package agentd
+package driver
 
 import "fmt"
 
-// DriverFactory is a constructor function for a SnapshotDriver. Each driver
-// file calls RegisterDriverFactory in its init() to enroll itself so that
+// DriverFactory is a constructor function for a Driver. Each driver package
+// calls RegisterDriverFactory in its init() to enroll itself so that
 // BuildDefaultRegistry can instantiate all drivers without main knowing their names.
-type DriverFactory func() SnapshotDriver
+type DriverFactory func() Driver
 
 var defaultFactories []DriverFactory
 
@@ -32,10 +32,10 @@ func RegisterDriverFactory(f DriverFactory) {
 }
 
 // BuildDefaultRegistry instantiates every factory registered via RegisterDriverFactory
-// and returns a ready-to-use DriverRegistry. Returns an error if two factories
-// produce drivers with the same name.
-func BuildDefaultRegistry() (*DriverRegistry, error) {
-	r := NewDriverRegistry()
+// and returns a ready-to-use Registry. Returns an error if two factories produce
+// drivers with the same name.
+func BuildDefaultRegistry() (*Registry, error) {
+	r := NewRegistry()
 	for _, f := range defaultFactories {
 		if err := r.Register(f()); err != nil {
 			return nil, err
@@ -44,41 +44,45 @@ func BuildDefaultRegistry() (*DriverRegistry, error) {
 	return r, nil
 }
 
-// DriverRegistry holds the set of SnapshotDrivers available on this node.
+// Registry holds the set of Drivers available on this node, keyed by provider name.
 // Use BuildDefaultRegistry to create one from self-registered drivers, or
-// NewDriverRegistry + Register for explicit construction (e.g. in tests).
-type DriverRegistry struct {
-	drivers map[string]SnapshotDriver
+// NewRegistry + Register for explicit construction (e.g. in tests).
+// Capability-specific views are obtained via methods such as SnapshotDrivers.
+type Registry struct {
+	drivers map[string]Driver
 }
 
-// NewDriverRegistry returns an empty registry.
-func NewDriverRegistry() *DriverRegistry {
-	return &DriverRegistry{drivers: make(map[string]SnapshotDriver)}
+// NewRegistry returns an empty registry.
+func NewRegistry() *Registry {
+	return &Registry{drivers: make(map[string]Driver)}
 }
 
 // Register adds a driver to the registry. Returns an error if a driver with
 // the same name has already been registered.
-func (r *DriverRegistry) Register(driver SnapshotDriver) error {
-	name := driver.Name()
+func (r *Registry) Register(d Driver) error {
+	name := d.Name()
 	if _, exists := r.drivers[name]; exists {
-		return fmt.Errorf("snapshot driver %q already registered", name)
+		return fmt.Errorf("driver %q already registered", name)
 	}
-	r.drivers[name] = driver
+	r.drivers[name] = d
 	return nil
 }
 
 // Get returns the driver registered under the given name, or false if absent.
-func (r *DriverRegistry) Get(name string) (SnapshotDriver, bool) {
+func (r *Registry) Get(name string) (Driver, bool) {
 	d, ok := r.drivers[name]
 	return d, ok
 }
 
-// Drivers returns a shallow copy of the internal driver map. Callers may
-// iterate or pass the result to other components without affecting the registry.
-func (r *DriverRegistry) Drivers() map[string]SnapshotDriver {
-	out := make(map[string]SnapshotDriver, len(r.drivers))
+// SnapshotDrivers returns a map of all registered drivers that implement
+// SnapshotDriver, keyed by provider name. Callers may iterate or pass the
+// result to snapshot-specific components without affecting the registry.
+func (r *Registry) SnapshotDrivers() map[string]SnapshotDriver {
+	out := make(map[string]SnapshotDriver)
 	for k, v := range r.drivers {
-		out[k] = v
+		if sd, ok := v.(SnapshotDriver); ok {
+			out[k] = sd
+		}
 	}
 	return out
 }

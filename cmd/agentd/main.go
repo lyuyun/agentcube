@@ -29,6 +29,10 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/volcano-sh/agentcube/pkg/agentd"
+	agentdriver "github.com/volcano-sh/agentcube/pkg/agentd/driver"
+	// Register all built-in snapshot drivers via their init() functions.
+	_ "github.com/volcano-sh/agentcube/pkg/agentd/driver/all"
+	agentcontroller "github.com/volcano-sh/agentcube/pkg/agentd/controller"
 	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
 )
 
@@ -56,6 +60,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Read the node name from the downward API environment variable.
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		fmt.Fprintf(os.Stderr, "NODE_NAME environment variable is required\n")
+		os.Exit(1)
+	}
+
+	registry, err := agentdriver.BuildDefaultRegistry()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unable to build driver registry: %v\n", err)
+		os.Exit(1)
+	}
+
 	if err = ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1alpha1.Sandbox{}).
 		Complete(&agentd.Reconciler{
@@ -66,19 +83,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Read the node name from the downward API environment variable.
-	nodeName := os.Getenv("NODE_NAME")
-	if nodeName == "" {
-		fmt.Fprintf(os.Stderr, "NODE_NAME environment variable is required\n")
-		os.Exit(1)
-	}
-
-	registry, err := agentd.BuildDefaultRegistry()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "unable to build driver registry: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Advertise snapshot capabilities on the node before controllers start so that
 	// the workload manager can select this node for snapshot builds immediately.
 	cs, err := kubernetes.NewForConfig(mgr.GetConfig())
@@ -86,23 +90,24 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unable to create kubernetes client: %v\n", err)
 		os.Exit(1)
 	}
-	if err := agentd.AdvertiseDriverCapabilities(ctrl.SetupSignalHandler(), cs, nodeName, registry.Drivers()); err != nil {
+	ctx := ctrl.SetupSignalHandler()
+	if err := agentdriver.AdvertiseDriverCapabilities(ctx, cs, nodeName, registry.SnapshotDrivers()); err != nil {
 		fmt.Fprintf(os.Stderr, "unable to advertise driver capabilities: %v\n", err)
 		os.Exit(1)
 	}
 
-	snapshotTaskReconciler := &agentd.SnapshotTaskReconciler{
+	snapshotTaskController := &agentcontroller.SnapshotTaskController{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		NodeName: nodeName,
-		Drivers:  registry.Drivers(),
+		Drivers:  registry.SnapshotDrivers(),
 	}
-	if err := snapshotTaskReconciler.SetupWithManager(mgr); err != nil {
+	if err := snapshotTaskController.SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "unable to create snapshot task controller: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "problem running manager: %v\n", err)
 		os.Exit(1)
 	}

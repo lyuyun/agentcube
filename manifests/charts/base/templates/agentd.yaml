@@ -1,0 +1,54 @@
+{{- if .Values.agentd.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: agentd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: agentd
+spec:
+  selector:
+    matchLabels:
+      app: agentd
+  template:
+    metadata:
+      labels:
+        app: agentd
+    spec:
+      serviceAccountName: agentd
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: agentd
+          image: "{{ .Values.agentd.image.repository }}:{{ .Values.agentd.image.tag }}"
+          imagePullPolicy: {{ .Values.agentd.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          {{- with .Values.agentd.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: kuasar-admin-socket
+              mountPath: /run/vmm-sandboxer-admin.sock
+          resources:
+            {{- toYaml .Values.agentd.resources | nindent 12 }}
+      volumes:
+        - name: kuasar-admin-socket
+          hostPath:
+            path: /run/vmm-sandboxer-admin.sock
+            type: Socket
+{{- end }}

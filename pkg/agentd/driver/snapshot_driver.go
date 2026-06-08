@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package agentd
+package driver
 
 import (
 	"context"
@@ -24,13 +24,17 @@ import (
 	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
 )
 
-// SnapshotDriver is an in-process interface implemented by each snapshot provider.
-// Node-agent-local implementations call the provider's runtime or VMM directly.
+// Restore is intentionally absent from SnapshotDriver.
+// Per the design (§7.6), restore is handled by the runtime compatibility layer
+// (CRI shim / VMM integration) that consumes the agentcube.volcano.sh/snapshot-key
+// annotation directly during Pod sandbox creation. The node agent stays on the
+// snapshot build path only.
+
+// SnapshotDriver extends Driver with snapshot build operations.
 // Each implementation is registered under a stable provider name and selected by
 // SandboxSnapshotTask.spec.providerName.
 type SnapshotDriver interface {
-	// Name returns the stable provider name (e.g. "snapstart.kuasar.io").
-	Name() string
+	Driver
 
 	// Capabilities returns the capabilities advertised by this driver.
 	Capabilities(ctx context.Context) SnapshotDriverCapabilities
@@ -41,14 +45,16 @@ type SnapshotDriver interface {
 	// The artifact must be usable for restore after the build Sandbox is deleted.
 	Create(ctx context.Context, req SnapshotDriverCreateRequest) (*SnapshotDriverArtifact, error)
 
-	// Delete removes the physical artifact.
-	Delete(ctx context.Context, artifact SnapshotDriverArtifact) error
+	// Delete removes the physical artifact identified by snapshotKey.
+	// The driver resolves snapshotKey to its internal reference (e.g. templateID) via List.
+	Delete(ctx context.Context, snapshotKey string) error
 
 	// List enumerates all artifacts managed by this driver on this node.
 	List(ctx context.Context) ([]SnapshotDriverArtifact, error)
 
-	// Inspect returns the current status of an artifact.
-	Inspect(ctx context.Context, artifact SnapshotDriverArtifact) (*SnapshotDriverArtifactStatus, error)
+	// Inspect returns the current status of the artifact identified by snapshotKey.
+	// The driver resolves snapshotKey to its internal reference via List.
+	Inspect(ctx context.Context, snapshotKey string) (*SnapshotDriverArtifactStatus, error)
 }
 
 // SnapshotDriverCapabilities describes what a driver can do.
@@ -82,6 +88,8 @@ type SnapshotDriverCreateRequest struct {
 }
 
 // SnapshotDriverArtifact is the driver's representation of a created artifact.
+// Driver-private references (e.g. internal template IDs) are not exposed here;
+// they live only inside driver implementations.
 type SnapshotDriverArtifact struct {
 	// ProviderName identifies the driver that created the artifact.
 	ProviderName string
@@ -91,10 +99,6 @@ type SnapshotDriverArtifact struct {
 
 	// SnapshotHash is the hash of the snapshot inputs.
 	SnapshotHash string
-
-	// ProviderRef is a driver-private reference to the physical artifact
-	// (e.g. a path, an ID, a URL). Opaque to the AgentCube control plane.
-	ProviderRef string
 }
 
 // SnapshotDriverArtifactStatus describes the current condition of an artifact.

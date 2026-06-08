@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	nodev1 "k8s.io/api/node/v1"
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 
@@ -63,7 +64,8 @@ func (h *ForkModeHandler) ComputeHash(ctx context.Context, ss *runtimev1alpha1.S
 		}
 		return "", fmt.Errorf("get source SandboxTemplate %q: %w", ss.Spec.SourceRef.Name, err)
 	}
-	return computeSnapshotHash(ss, tmpl.Spec.PodTemplate.Spec, sc)
+	// sourceUID must be the SandboxTemplate UID, not the SandboxSnapshot UID (design §6).
+	return computeSnapshotHash(ss, tmpl.UID, tmpl.Spec.PodTemplate.Spec, sc)
 }
 
 func (h *ForkModeHandler) PrepareArtifactSet(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, _ *runtimev1alpha1.SnapshotClass, manifest *store.SnapshotArtifactManifest, ownerKey, rawVersion, currentHash string) (string, error) {
@@ -80,7 +82,25 @@ func (h *ForkModeHandler) PrepareArtifactSet(ctx context.Context, ss *runtimev1a
 }
 
 func (h *ForkModeHandler) EnsureTasks(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, sc *runtimev1alpha1.SnapshotClass, manifest *store.SnapshotArtifactManifest, ownerKey, rawVersion, workingKey string, artifactSet store.SnapshotArtifactSet) (string, error) {
-	targetNodes, err := h.selectTargetNodes(ctx, sc)
+	// Reset failed artifacts whose retry backoff has elapsed so they can be re-dispatched.
+	retryDue := retryDueNodes(artifactSet.Artifacts)
+	if len(retryDue) > 0 {
+		kept := artifactSet.Artifacts[:0]
+		for _, art := range artifactSet.Artifacts {
+			if _, due := retryDue[art.NodeName]; !due {
+				kept = append(kept, art)
+			}
+		}
+		artifactSet.Artifacts = kept
+		manifest.ArtifactSets[workingKey] = artifactSet
+		var err error
+		rawVersion, err = saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
+		if err != nil {
+			return rawVersion, err
+		}
+	}
+
+	targetNodes, err := h.selectTargetNodes(ctx, ss, sc)
 	if err != nil {
 		return rawVersion, fmt.Errorf("select target nodes: %w", err)
 	}
@@ -90,8 +110,13 @@ func (h *ForkModeHandler) EnsureTasks(ctx context.Context, ss *runtimev1alpha1.S
 		if _, covered := coveredNodes[nodeName]; covered {
 			continue
 		}
-		if err := h.ensureBuildSandboxAndTask(ctx, ss, sc, artifactSet.SnapshotKey, artifactSet.SnapshotHash, nodeName); err != nil {
+		created, err := h.ensureBuildSandboxAndTask(ctx, ss, sc, artifactSet.SnapshotKey, artifactSet.SnapshotHash, nodeName)
+		if err != nil {
 			log.FromContext(ctx).Error(err, "failed to ensure build sandbox and task", "node", nodeName)
+			continue
+		}
+		if !created {
+			// Task deletion is in progress; artifact will be added on the next reconcile.
 			continue
 		}
 		artifactSet.Artifacts = append(artifactSet.Artifacts, newCreatingArtifact(sc.Spec.ProviderName, nodeName, artifactSet))
@@ -104,8 +129,26 @@ func (h *ForkModeHandler) EnsureTasks(ctx context.Context, ss *runtimev1alpha1.S
 	return saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
 }
 
+// retryDueNodes returns the set of node names whose failed artifacts have passed their retry time.
+func retryDueNodes(artifacts []store.SnapshotArtifact) map[string]struct{} {
+	now := time.Now()
+	due := make(map[string]struct{})
+	for _, art := range artifacts {
+		if art.Phase != store.SnapshotArtifactPhaseFailed {
+			continue
+		}
+		if art.Retry == nil || art.Retry.NextRetryAt == nil {
+			continue
+		}
+		if !now.Before(*art.Retry.NextRetryAt) {
+			due[art.NodeName] = struct{}{}
+		}
+	}
+	return due
+}
+
 func (h *ForkModeHandler) ReadyToPromote(pending store.SnapshotArtifactSet) bool {
-	return allNodeArtifactsReady(pending.Artifacts)
+	return anyNodeArtifactReady(pending.Artifacts)
 }
 
 func (h *ForkModeHandler) CleanupTask(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, task *runtimev1alpha1.SandboxSnapshotTask) error {
@@ -124,17 +167,35 @@ func (h *ForkModeHandler) CleanupTask(ctx context.Context, ss *runtimev1alpha1.S
 }
 
 func (h *ForkModeHandler) CleanupAll(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot) error {
-	sandboxList := &sandboxv1alpha1.SandboxList{}
-	if err := h.Client.List(ctx, sandboxList, client.InNamespace(ss.Namespace), client.MatchingLabels{
-		runtimev1alpha1.SnapshotNameLabelKey:  ss.Name,
-		runtimev1alpha1.SnapshotBuildLabelKey: "true",
-	}); err != nil {
-		return fmt.Errorf("list build sandboxes: %w", err)
+	// Enumerate build Sandboxes via the tasks that own them (design §4.5, §5.4).
+	// SandboxSnapshotTask.spec.targetSandboxRef is the authoritative reference to each
+	// build Sandbox; the task is the correct navigation point, not a label scan.
+	// Kubernetes GC (ownerReferences) provides a safety net for anything this loop misses.
+	taskList := &runtimev1alpha1.SandboxSnapshotTaskList{}
+	if err := h.Client.List(ctx, taskList,
+		client.InNamespace(ss.Namespace),
+		client.MatchingFields{taskSnapshotRefIndexKey: ss.Name},
+	); err != nil {
+		return fmt.Errorf("list snapshot tasks for cleanup: %w", err)
 	}
-	for i := range sandboxList.Items {
-		sb := &sandboxList.Items[i]
+	for i := range taskList.Items {
+		task := &taskList.Items[i]
+		if task.Spec.SnapshotUID != ss.UID {
+			continue
+		}
+		sbName := task.Spec.TargetSandboxRef.Name
+		if sbName == "" {
+			continue
+		}
+		sb := &sandboxv1alpha1.Sandbox{}
+		if err := h.Client.Get(ctx, types.NamespacedName{Name: sbName, Namespace: ss.Namespace}, sb); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("get build sandbox %s: %w", sbName, err)
+		}
 		if err := h.Client.Delete(ctx, sb); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete build sandbox %s: %w", sb.Name, err)
+			return fmt.Errorf("delete build sandbox %s: %w", sbName, err)
 		}
 	}
 	return nil
@@ -183,19 +244,89 @@ func (h *ForkModeHandler) ensurePendingSet(ctx context.Context, ss *runtimev1alp
 	return saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
 }
 
-func (h *ForkModeHandler) selectTargetNodes(ctx context.Context, sc *runtimev1alpha1.SnapshotClass) ([]string, error) {
+func (h *ForkModeHandler) selectTargetNodes(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, sc *runtimev1alpha1.SnapshotClass) ([]string, error) {
+	tmpl := &extensionsv1alpha1.SandboxTemplate{}
+	if err := h.Client.Get(ctx, types.NamespacedName{Name: ss.Spec.SourceRef.Name, Namespace: ss.Namespace}, tmpl); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("source SandboxTemplate %q not found", ss.Spec.SourceRef.Name)
+		}
+		return nil, fmt.Errorf("get source SandboxTemplate %q: %w", ss.Spec.SourceRef.Name, err)
+	}
+	podSpec := &tmpl.Spec.PodTemplate.Spec
+
+	// Fetch RuntimeClass scheduling constraints when specified.
+	var runtimeClassNodeSelector map[string]string
+	var runtimeClassTolerations []corev1.Toleration
+	if podSpec.RuntimeClassName != nil && *podSpec.RuntimeClassName != "" {
+		rc := &nodev1.RuntimeClass{}
+		if err := h.Client.Get(ctx, types.NamespacedName{Name: *podSpec.RuntimeClassName}, rc); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("get RuntimeClass %q: %w", *podSpec.RuntimeClassName, err)
+			}
+		} else if rc.Scheduling != nil {
+			runtimeClassNodeSelector = rc.Scheduling.NodeSelector
+			runtimeClassTolerations = rc.Scheduling.Tolerations
+		}
+	}
+
+	// Build merged nodeSelector: SnapshotClass + SandboxTemplate + RuntimeClass (all must match).
+	merged := make(map[string]string)
+	for k, v := range sc.Spec.NodeSelector {
+		merged[k] = v
+	}
+	for k, v := range podSpec.NodeSelector {
+		merged[k] = v
+	}
+	for k, v := range runtimeClassNodeSelector {
+		merged[k] = v
+	}
+
+	// Build effective tolerations: pod tolerations ∪ RuntimeClass tolerations.
+	effectiveTolerations := append(podSpec.Tolerations, runtimeClassTolerations...)
+
+	capLabel := runtimev1alpha1.SnapshotProviderLabelPrefix + sc.Spec.ProviderName
+
+	// Explicit nodeName pins to a single node; validate all constraints still apply.
+	if podSpec.NodeName != "" {
+		node := &corev1.Node{}
+		if err := h.Client.Get(ctx, types.NamespacedName{Name: podSpec.NodeName}, node); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("get pinned node %q: %w", podSpec.NodeName, err)
+		}
+		if !nodeIsReady(node) || node.Labels[capLabel] != "true" {
+			return nil, nil
+		}
+		for k, v := range merged {
+			if node.Labels[k] != v {
+				return nil, nil
+			}
+		}
+		if !nodeToleratesTaints(effectiveTolerations, node.Spec.Taints) {
+			return nil, nil
+		}
+		return []string{podSpec.NodeName}, nil
+	}
+
 	nodeList := &corev1.NodeList{}
-	sel := labels.SelectorFromSet(sc.Spec.NodeSelector)
-	if err := h.Client.List(ctx, nodeList, &client.ListOptions{LabelSelector: sel}); err != nil {
+	if err := h.Client.List(ctx, nodeList, &client.ListOptions{LabelSelector: labels.SelectorFromSet(merged)}); err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
+
 	var result []string
-	for _, node := range nodeList.Items {
-		if !nodeIsReady(&node) {
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		if !nodeIsReady(node) {
 			continue
 		}
-		capLabel := runtimev1alpha1.SnapshotProviderLabelPrefix + sc.Spec.ProviderName
 		if node.Labels[capLabel] != "true" {
+			continue
+		}
+		if podSpec.Affinity != nil && !matchNodeAffinity(node, podSpec.Affinity.NodeAffinity) {
+			continue
+		}
+		if !nodeToleratesTaints(effectiveTolerations, node.Spec.Taints) {
 			continue
 		}
 		result = append(result, node.Name)
@@ -203,31 +334,157 @@ func (h *ForkModeHandler) selectTargetNodes(ctx context.Context, sc *runtimev1al
 	return result, nil
 }
 
-func (h *ForkModeHandler) ensureBuildSandboxAndTask(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, sc *runtimev1alpha1.SnapshotClass, snapshotKey, snapshotHash, nodeName string) error {
+// matchNodeAffinity checks if a node satisfies the required node affinity of a pod.
+func matchNodeAffinity(node *corev1.Node, affinity *corev1.NodeAffinity) bool {
+	if affinity == nil || affinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return true
+	}
+	// NodeSelectorTerms are OR'd.
+	for _, term := range affinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		if matchNodeSelectorTerm(node, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchNodeSelectorTerm(node *corev1.Node, term corev1.NodeSelectorTerm) bool {
+	for _, req := range term.MatchExpressions {
+		if !matchNodeSelectorRequirement(node.Labels, req) {
+			return false
+		}
+	}
+	for _, req := range term.MatchFields {
+		if !matchNodeField(node, req) {
+			return false
+		}
+	}
+	return true
+}
+
+// matchNodeField evaluates a single MatchFields requirement against a node.
+// Only metadata.name is supported; other fields are treated as always-satisfied.
+func matchNodeField(node *corev1.Node, req corev1.NodeSelectorRequirement) bool {
+	if req.Key != "metadata.name" {
+		return true
+	}
+	switch req.Operator {
+	case corev1.NodeSelectorOpIn:
+		for _, v := range req.Values {
+			if v == node.Name {
+				return true
+			}
+		}
+		return false
+	case corev1.NodeSelectorOpNotIn:
+		for _, v := range req.Values {
+			if v == node.Name {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+func matchNodeSelectorRequirement(nodeLabels map[string]string, req corev1.NodeSelectorRequirement) bool {
+	val, exists := nodeLabels[req.Key]
+	switch req.Operator {
+	case corev1.NodeSelectorOpIn:
+		if !exists {
+			return false
+		}
+		for _, v := range req.Values {
+			if v == val {
+				return true
+			}
+		}
+		return false
+	case corev1.NodeSelectorOpNotIn:
+		if !exists {
+			return true
+		}
+		for _, v := range req.Values {
+			if v == val {
+				return false
+			}
+		}
+		return true
+	case corev1.NodeSelectorOpExists:
+		return exists
+	case corev1.NodeSelectorOpDoesNotExist:
+		return !exists
+	default:
+		return true
+	}
+}
+
+// nodeToleratesTaints returns true only when all node taints are tolerated.
+func nodeToleratesTaints(tolerations []corev1.Toleration, taints []corev1.Taint) bool {
+	for _, taint := range taints {
+		if !taintTolerated(taint, tolerations) {
+			return false
+		}
+	}
+	return true
+}
+
+func taintTolerated(taint corev1.Taint, tolerations []corev1.Toleration) bool {
+	for _, t := range tolerations {
+		if len(t.Effect) > 0 && t.Effect != taint.Effect {
+			continue
+		}
+		if t.Operator == corev1.TolerationOpExists {
+			if t.Key == "" || t.Key == taint.Key {
+				return true
+			}
+			continue
+		}
+		if t.Key == taint.Key && t.Value == taint.Value {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureBuildSandboxAndTask creates the build Sandbox and SandboxSnapshotTask for the given node.
+// Returns (true, nil) when a new task was successfully created, (false, nil) when the caller
+// should wait for a next reconcile (e.g. a terminal task is still terminating).
+func (h *ForkModeHandler) ensureBuildSandboxAndTask(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, sc *runtimev1alpha1.SnapshotClass, snapshotKey, snapshotHash, nodeName string) (bool, error) {
 	sbName := buildSandboxName(ss.Name, nodeName)
 	taskName := buildTaskName(nodeName, snapshotKey)
 
 	existingTask := &runtimev1alpha1.SandboxSnapshotTask{}
 	err := h.Client.Get(ctx, types.NamespacedName{Name: taskName, Namespace: ss.Namespace}, existingTask)
 	if err == nil {
+		phase := existingTask.Status.Phase
+		if phase == runtimev1alpha1.SnapshotArtifactPhaseFailed || phase == runtimev1alpha1.SnapshotArtifactPhaseUnavailable {
+			// Task is terminal. If already terminating, wait for GC before recreating.
+			if existingTask.DeletionTimestamp != nil {
+				return false, nil
+			}
+			if err := h.Client.Delete(ctx, existingTask); err != nil && !apierrors.IsNotFound(err) {
+				return false, fmt.Errorf("delete terminal task for retry %s: %w", taskName, err)
+			}
+			// Deletion is now in flight; a new task will be created on the next reconcile.
+			return false, nil
+		}
+		// Non-terminal task already exists; just ensure the build sandbox is present.
 		_, err = h.ensureBuildSandbox(ctx, ss, snapshotKey, nodeName, sbName)
-		return err
+		return false, err
 	}
 	if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get snapshot task %s: %w", taskName, err)
+		return false, fmt.Errorf("get snapshot task %s: %w", taskName, err)
 	}
 
 	buildSandbox, err := h.ensureBuildSandbox(ctx, ss, snapshotKey, nodeName, sbName)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	task := &runtimev1alpha1.SandboxSnapshotTask{
-		ObjectMeta: metaWithLabels(taskName, ss.Namespace, map[string]string{
-			runtimev1alpha1.SnapshotNameLabelKey: ss.Name,
-			runtimev1alpha1.SnapshotKeyLabelKey:  snapshotKey,
-			runtimev1alpha1.SnapshotNodeLabelKey: nodeName,
-		}),
+		ObjectMeta: metaWithLabels(taskName, ss.Namespace, nil),
 		Spec: runtimev1alpha1.SandboxSnapshotTaskSpec{
 			SnapshotRef: corev1.TypedLocalObjectReference{
 				APIGroup: ptr.To(runtimev1alpha1.GroupVersion.Group),
@@ -248,12 +505,12 @@ func (h *ForkModeHandler) ensureBuildSandboxAndTask(ctx context.Context, ss *run
 		},
 	}
 	if err := controllerutil.SetControllerReference(ss, task, h.Scheme); err != nil {
-		return fmt.Errorf("set controller reference on task: %w", err)
+		return false, fmt.Errorf("set controller reference on task: %w", err)
 	}
 	if err := h.Client.Create(ctx, task); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create snapshot task %s: %w", taskName, err)
+		return false, fmt.Errorf("create snapshot task %s: %w", taskName, err)
 	}
-	return nil
+	return true, nil
 }
 
 func (h *ForkModeHandler) ensureBuildSandbox(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, snapshotKey, nodeName, sbName string) (*sandboxv1alpha1.Sandbox, error) {
@@ -266,14 +523,16 @@ func (h *ForkModeHandler) ensureBuildSandbox(ctx context.Context, ss *runtimev1a
 		}
 		podSpec := tmpl.Spec.PodTemplate.Spec.DeepCopy()
 		podSpec.NodeName = nodeName
+		// Signal the runtime to reach a fork-safe point before reporting readiness to the driver.
+		for i := range podSpec.Containers {
+			podSpec.Containers[i].Env = append(podSpec.Containers[i].Env, corev1.EnvVar{
+				Name:  "AGENTCUBE_SNAPSTART_BUILD_MODE",
+				Value: "true",
+			})
+		}
 
 		buildSandbox = &sandboxv1alpha1.Sandbox{
-			ObjectMeta: metaWithLabels(sbName, ss.Namespace, map[string]string{
-				runtimev1alpha1.SnapshotNameLabelKey:  ss.Name,
-				runtimev1alpha1.SnapshotKeyLabelKey:   snapshotKey,
-				runtimev1alpha1.SnapshotNodeLabelKey:  nodeName,
-				runtimev1alpha1.SnapshotBuildLabelKey: "true",
-			}),
+			ObjectMeta: metaWithLabels(sbName, ss.Namespace, nil),
 			Spec: sandboxv1alpha1.SandboxSpec{
 				PodTemplate: sandboxv1alpha1.PodTemplate{Spec: *podSpec},
 				Replicas:    ptr.To[int32](1),
@@ -303,16 +562,36 @@ func forkRebuildsOnSourceChange(ss *runtimev1alpha1.SandboxSnapshot) bool {
 	return *ss.Spec.ForkPolicy.RebuildOnSourceChange
 }
 
-func allNodeArtifactsReady(artifacts []store.SnapshotArtifact) bool {
-	if len(artifacts) == 0 {
-		return false
-	}
+func anyNodeArtifactReady(artifacts []store.SnapshotArtifact) bool {
 	for _, a := range artifacts {
-		if a.Phase != store.SnapshotArtifactPhaseReady {
-			return false
+		if a.Phase == store.SnapshotArtifactPhaseReady {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+// validatedSnapshotKey returns the artifact set's SnapshotKey when at least one
+// Ready artifact passes all required validations (design §5.6 step 5):
+// provider name present, snapshot hash consistent, snapshot key consistent.
+// Returns an empty string when no valid artifact is found.
+func validatedSnapshotKey(set store.SnapshotArtifactSet) string {
+	for _, art := range set.Artifacts {
+		if art.Phase != store.SnapshotArtifactPhaseReady {
+			continue
+		}
+		if art.ProviderName == "" {
+			continue
+		}
+		if art.SnapshotHash != set.SnapshotHash {
+			continue
+		}
+		if art.SnapshotKey != set.SnapshotKey {
+			continue
+		}
+		return set.SnapshotKey
+	}
+	return ""
 }
 
 func coveredArtifactNodes(artifacts []store.SnapshotArtifact) map[string]struct{} {
@@ -365,12 +644,12 @@ type snapshotClassHash struct {
 	ProviderName string `json:"providerName"`
 }
 
-func computeSnapshotHash(ss *runtimev1alpha1.SandboxSnapshot, podSpec corev1.PodSpec, sc *runtimev1alpha1.SnapshotClass) (string, error) {
+func computeSnapshotHash(ss *runtimev1alpha1.SandboxSnapshot, sourceUID types.UID, podSpec corev1.PodSpec, sc *runtimev1alpha1.SnapshotClass) (string, error) {
 	input := snapshotHashInput{
 		SnapshotMode:    string(ss.Spec.SnapshotMode),
 		SourceNamespace: ss.Namespace,
 		SourceName:      ss.Spec.SourceRef.Name,
-		SourceUID:       string(ss.UID),
+		SourceUID:       string(sourceUID),
 		PodTemplateSpec: normalizePodSpec(podSpec),
 		SnapshotClass: snapshotClassHash{
 			Name:         sc.Name,
@@ -389,7 +668,30 @@ func normalizePodSpec(spec corev1.PodSpec) corev1.PodSpec {
 	s := spec.DeepCopy()
 	s.NodeName = ""
 	sort.Slice(s.Tolerations, func(i, j int) bool {
-		return s.Tolerations[i].Key < s.Tolerations[j].Key
+		a, b := s.Tolerations[i], s.Tolerations[j]
+		if a.Key != b.Key {
+			return a.Key < b.Key
+		}
+		if a.Operator != b.Operator {
+			return a.Operator < b.Operator
+		}
+		if a.Value != b.Value {
+			return a.Value < b.Value
+		}
+		if a.Effect != b.Effect {
+			return a.Effect < b.Effect
+		}
+		// nil and ptr(0) both evaluate to 0 but marshal differently;
+		// treat nil < non-nil so the sort order is fully deterministic.
+		aNil := a.TolerationSeconds == nil
+		bNil := b.TolerationSeconds == nil
+		if aNil != bNil {
+			return aNil
+		}
+		if !aNil {
+			return *a.TolerationSeconds < *b.TolerationSeconds
+		}
+		return false
 	})
 	return *s
 }
@@ -402,10 +704,11 @@ func metaWithLabels(name, namespace string, lbls map[string]string) metav1.Objec
 	}
 }
 
-// lookupActiveForkSnapshotKey returns the active snapshot key for a Fork-mode SandboxSnapshot
-// whose sourceRef matches sandboxTemplateName, or an empty string when none is Ready.
-// Errors from the artifact store are logged and treated as cache-miss so session creation
-// falls back to cold start rather than failing.
+// lookupActiveForkSnapshotKey returns the active snapshot key for a Fork-mode
+// SandboxSnapshot whose sourceRef matches sandboxTemplateName.
+// Returns an empty string when no Ready artifact is found.
+// Errors from the artifact store are logged and treated as cache-miss so session
+// creation falls back to cold start rather than failing.
 func lookupActiveForkSnapshotKey(
 	ctx context.Context,
 	k8sClient client.Client,
@@ -413,18 +716,23 @@ func lookupActiveForkSnapshotKey(
 	namespace, sandboxTemplateName string,
 ) string {
 	snapshotList := &runtimev1alpha1.SandboxSnapshotList{}
-	if err := k8sClient.List(ctx, snapshotList, client.InNamespace(namespace)); err != nil {
+	if err := k8sClient.List(ctx, snapshotList,
+		client.InNamespace(namespace),
+		client.MatchingFields{snapshotSourceRefIndexKey: sandboxTemplateName},
+	); err != nil {
 		klog.V(4).InfoS("snapshot lookup: failed to list snapshots, falling back to cold start",
 			"namespace", namespace, "error", err)
 		return ""
 	}
 
+	// Prefer the most recently created snapshot when multiple match.
+	sort.Slice(snapshotList.Items, func(i, j int) bool {
+		return snapshotList.Items[j].CreationTimestamp.Before(&snapshotList.Items[i].CreationTimestamp)
+	})
+
 	for i := range snapshotList.Items {
 		ss := &snapshotList.Items[i]
 		if ss.Spec.SnapshotMode != runtimev1alpha1.SandboxSnapshotModeFork {
-			continue
-		}
-		if ss.Spec.SourceRef.Name != sandboxTemplateName {
 			continue
 		}
 		if ss.Status.Phase != runtimev1alpha1.SandboxSnapshotPhaseReady {
@@ -445,12 +753,11 @@ func lookupActiveForkSnapshotKey(
 		if !ok {
 			continue
 		}
-		for _, art := range activeSet.Artifacts {
-			if art.Phase == store.SnapshotArtifactPhaseReady {
-				klog.V(4).InfoS("snapshot lookup: found active fork snapshot key",
-					"snapshot", ss.Name, "snapshotKey", manifest.ActiveSetRef.SnapshotKey)
-				return manifest.ActiveSetRef.SnapshotKey
-			}
+
+		if validatedSnapshotKey(activeSet) != "" {
+			klog.V(4).InfoS("snapshot lookup: found active fork snapshot key",
+				"snapshot", ss.Name, "snapshotKey", manifest.ActiveSetRef.SnapshotKey)
+			return manifest.ActiveSetRef.SnapshotKey
 		}
 	}
 	return ""

@@ -30,11 +30,16 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 
 	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
 	"github.com/volcano-sh/agentcube/pkg/store"
@@ -116,8 +121,8 @@ func (r *SandboxSnapshotReconciler) reconcileWithHandler(ctx context.Context, ss
 	}
 
 	if manifest.PendingSetRef.SnapshotKey != "" {
-		pending := manifest.ArtifactSets[manifest.PendingSetRef.SnapshotKey]
-		if handler.ReadyToPromote(pending) {
+		pending, ok := manifest.ArtifactSets[manifest.PendingSetRef.SnapshotKey]
+		if ok && handler.ReadyToPromote(pending) {
 			logger.Info("promoting pending artifact set to active", "snapshot", ss.Name, "snapshotKey", pending.SnapshotKey)
 			if manifest.ActiveSetRef.SnapshotKey != "" {
 				delete(manifest.ArtifactSets, manifest.ActiveSetRef.SnapshotKey)
@@ -131,7 +136,15 @@ func (r *SandboxSnapshotReconciler) reconcileWithHandler(ctx context.Context, ss
 		}
 	}
 
-	return r.aggregateAndUpdateStatus(ctx, ss, manifest)
+	result, err := r.aggregateAndUpdateStatus(ctx, ss, manifest)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Cleanup completed tasks only after status has been aggregated (design §5.5 ordering).
+	if manifest.ActiveSetRef.SnapshotKey != "" {
+		r.cleanupCompletedTasks(ctx, ss, manifest.ActiveSetRef.SnapshotKey, handler)
+	}
+	return result, nil
 }
 
 func (r *SandboxSnapshotReconciler) reconcileDelete(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot) (ctrl.Result, error) {
@@ -180,21 +193,14 @@ func (r *SandboxSnapshotReconciler) reconcileTasksAndArtifacts(ctx context.Conte
 		return rawVersion, err
 	}
 
-	if workingKey == manifest.ActiveSetRef.SnapshotKey {
-		r.cleanupCompletedTasks(ctx, ss, workingKey, handler)
-	}
-
 	return rawVersion, nil
 }
 
 func (r *SandboxSnapshotReconciler) cleanupCompletedTasks(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, snapshotKey string, handler SnapshotModeHandler) {
 	logger := log.FromContext(ctx)
 
-	taskList := &runtimev1alpha1.SandboxSnapshotTaskList{}
-	if err := r.List(ctx, taskList, client.InNamespace(ss.Namespace), client.MatchingLabels{
-		runtimev1alpha1.SnapshotNameLabelKey: ss.Name,
-		runtimev1alpha1.SnapshotKeyLabelKey:  snapshotKey,
-	}); err != nil {
+	taskList, err := r.listSnapshotTasks(ctx, ss, snapshotKey)
+	if err != nil {
 		logger.Error(err, "list completed tasks for cleanup")
 		return
 	}
@@ -202,7 +208,9 @@ func (r *SandboxSnapshotReconciler) cleanupCompletedTasks(ctx context.Context, s
 	for i := range taskList.Items {
 		task := &taskList.Items[i]
 		phase := task.Status.Phase
-		if phase != runtimev1alpha1.SnapshotArtifactPhaseReady && phase != runtimev1alpha1.SnapshotArtifactPhaseFailed {
+		if phase != runtimev1alpha1.SnapshotArtifactPhaseReady &&
+			phase != runtimev1alpha1.SnapshotArtifactPhaseFailed &&
+			phase != runtimev1alpha1.SnapshotArtifactPhaseUnavailable {
 			continue
 		}
 		if err := handler.CleanupTask(ctx, ss, task); err != nil {
@@ -214,15 +222,29 @@ func (r *SandboxSnapshotReconciler) cleanupCompletedTasks(ctx context.Context, s
 	}
 }
 
+// taskSnapshotRefIndexKey is the field index used to look up SandboxSnapshotTasks by
+// their owning SandboxSnapshot name.
+const taskSnapshotRefIndexKey = "spec.snapshotRef.name"
+
+// taskTargetNodeIndexKey is the field index used to look up SandboxSnapshotTasks by
+// their target node name.
+const taskTargetNodeIndexKey = "spec.targetNodeName"
+
 func (r *SandboxSnapshotReconciler) listSnapshotTasks(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, snapshotKey string) (*runtimev1alpha1.SandboxSnapshotTaskList, error) {
-	taskList := &runtimev1alpha1.SandboxSnapshotTaskList{}
-	if err := r.List(ctx, taskList, client.InNamespace(ss.Namespace), client.MatchingLabels{
-		runtimev1alpha1.SnapshotNameLabelKey: ss.Name,
-		runtimev1alpha1.SnapshotKeyLabelKey:  snapshotKey,
-	}); err != nil {
+	all := &runtimev1alpha1.SandboxSnapshotTaskList{}
+	if err := r.List(ctx, all, client.InNamespace(ss.Namespace),
+		client.MatchingFields{taskSnapshotRefIndexKey: ss.Name},
+	); err != nil {
 		return nil, fmt.Errorf("list snapshot tasks: %w", err)
 	}
-	return taskList, nil
+	// Filter to the active snapshotKey in-memory; the field index scopes to owner only.
+	filtered := &runtimev1alpha1.SandboxSnapshotTaskList{}
+	for i := range all.Items {
+		if all.Items[i].Spec.SnapshotKey == snapshotKey {
+			filtered.Items = append(filtered.Items, all.Items[i])
+		}
+	}
+	return filtered, nil
 }
 
 func (r *SandboxSnapshotReconciler) syncArtifactStatus(ctx context.Context, manifest *store.SnapshotArtifactManifest, ownerKey, rawVersion, workingKey string, artifactSet store.SnapshotArtifactSet, taskList *runtimev1alpha1.SandboxSnapshotTaskList) (string, store.SnapshotArtifactSet, error) {
@@ -258,11 +280,44 @@ func updateArtifactFromTask(art *store.SnapshotArtifact, task *runtimev1alpha1.S
 	}
 	art.Phase = newPhase
 	art.Message = task.Status.Message
-	if newPhase == store.SnapshotArtifactPhaseReady && art.CreatedAt == nil {
+	switch newPhase {
+	case store.SnapshotArtifactPhaseReady:
 		now := time.Now()
-		art.CreatedAt = &now
+		if art.CreatedAt == nil {
+			art.CreatedAt = &now
+		}
+		recordBuildDuration(art.ProviderName, string(task.Spec.SnapshotMode), task.CreationTimestamp.Time)
+	case store.SnapshotArtifactPhaseFailed:
+		incrementBuildRetry(art)
 	}
+	recordArtifactPhaseTransition(art.ProviderName, newPhase)
 	return true
+}
+
+// retryBackoffSteps defines the per-attempt wait durations before a failed artifact is retried.
+var retryBackoffSteps = []time.Duration{
+	1 * time.Minute,
+	2 * time.Minute,
+	4 * time.Minute,
+	8 * time.Minute,
+	16 * time.Minute,
+	30 * time.Minute,
+}
+
+// incrementBuildRetry advances the retry counter and computes the next eligible retry time.
+func incrementBuildRetry(art *store.SnapshotArtifact) {
+	if art.Retry == nil {
+		art.Retry = &store.SnapshotBuildRetry{}
+	}
+	art.Retry.FailureCount++
+	now := time.Now()
+	art.Retry.LastFailedAt = &now
+	idx := int(art.Retry.FailureCount) - 1
+	if idx >= len(retryBackoffSteps) {
+		idx = len(retryBackoffSteps) - 1
+	}
+	next := now.Add(retryBackoffSteps[idx])
+	art.Retry.NextRetryAt = &next
 }
 
 func (r *SandboxSnapshotReconciler) aggregateAndUpdateStatus(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, manifest *store.SnapshotArtifactManifest) (ctrl.Result, error) {
@@ -363,7 +418,10 @@ func saveManifest(ctx context.Context, as store.ArtifactStore, ownerKey string, 
 		}
 		return version, fmt.Errorf("put artifact manifest: %w", err)
 	}
-	raw, _ := json.Marshal(manifest)
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		return version, fmt.Errorf("marshal manifest for version token: %w", err)
+	}
 	return string(raw), nil
 }
 
@@ -384,7 +442,17 @@ func startNewArtifactSet(ss *runtimev1alpha1.SandboxSnapshot, manifest *store.Sn
 
 func buildSnapshotKey(ss *runtimev1alpha1.SandboxSnapshot, rebuildSeq int32) string {
 	mode := strings.ToLower(string(ss.Spec.SnapshotMode))
-	return fmt.Sprintf("%s-%s-g%d-r%d", normalizeLabel(ss.Name), mode, ss.Generation, rebuildSeq)
+	// Build suffix first so we know how many chars are left for the name prefix.
+	// The full key is used as a label value and must not exceed 63 characters.
+	suffix := fmt.Sprintf("-%s-g%d-r%d", mode, ss.Generation, rebuildSeq)
+	name := normalizeLabel(ss.Name)
+	if maxLen := 63 - len(suffix); len(name) > maxLen {
+		if maxLen < 0 {
+			maxLen = 0
+		}
+		name = strings.TrimRight(name[:maxLen], "-")
+	}
+	return name + suffix
 }
 
 func normalizeLabel(s string) string {
@@ -474,6 +542,9 @@ func containsMode(modes []runtimev1alpha1.SandboxSnapshotMode, mode runtimev1alp
 	return false
 }
 
+// snapshotSourceRefIndexKey is the field index used to look up SandboxSnapshots by sourceRef name.
+const snapshotSourceRefIndexKey = "spec.sourceRef.name"
+
 // SetupWithManager registers the controller and initializes mode handlers.
 func (r *SandboxSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorderFor("sandbox-snapshot-controller")
@@ -485,9 +556,107 @@ func (r *SandboxSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			Scheme:        mgr.GetScheme(),
 		},
 	}
+
+	ctx := context.Background()
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &runtimev1alpha1.SandboxSnapshot{}, snapshotSourceRefIndexKey, func(obj client.Object) []string {
+		ss := obj.(*runtimev1alpha1.SandboxSnapshot)
+		return []string{ss.Spec.SourceRef.Name}
+	}); err != nil {
+		return fmt.Errorf("setup sourceRef field index: %w", err)
+	}
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &runtimev1alpha1.SandboxSnapshotTask{}, taskSnapshotRefIndexKey, func(obj client.Object) []string {
+		task := obj.(*runtimev1alpha1.SandboxSnapshotTask)
+		return []string{task.Spec.SnapshotRef.Name}
+	}); err != nil {
+		return fmt.Errorf("setup task snapshotRef field index: %w", err)
+	}
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &runtimev1alpha1.SandboxSnapshotTask{}, taskTargetNodeIndexKey, func(obj client.Object) []string {
+		task := obj.(*runtimev1alpha1.SandboxSnapshotTask)
+		return []string{task.Spec.TargetNodeName}
+	}); err != nil {
+		return fmt.Errorf("setup task targetNode field index: %w", err)
+	}
+
+	// templateToSnapshotMapper re-enqueues all SandboxSnapshots that reference a changed SandboxTemplate.
+	templateToSnapshotMapper := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+		snapshotList := &runtimev1alpha1.SandboxSnapshotList{}
+		if err := r.List(ctx, snapshotList,
+			client.InNamespace(obj.GetNamespace()),
+			client.MatchingFields{snapshotSourceRefIndexKey: obj.GetName()},
+		); err != nil {
+			return nil
+		}
+		reqs := make([]ctrl.Request, 0, len(snapshotList.Items))
+		for _, ss := range snapshotList.Items {
+			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
+				Namespace: ss.Namespace,
+				Name:      ss.Name,
+			}})
+		}
+		return reqs
+	})
+
+	// nodeToSnapshotMapper re-enqueues all SandboxSnapshots on any node change.
+	// Listing all snapshots ensures that a newly-joined node (which has no tasks yet)
+	// also triggers artifact builds for existing snapshots.
+	nodeToSnapshotMapper := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []ctrl.Request {
+		snapshotList := &runtimev1alpha1.SandboxSnapshotList{}
+		if err := r.List(ctx, snapshotList); err != nil {
+			return nil
+		}
+		reqs := make([]ctrl.Request, 0, len(snapshotList.Items))
+		for _, ss := range snapshotList.Items {
+			reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
+				Namespace: ss.Namespace,
+				Name:      ss.Name,
+			}})
+		}
+		return reqs
+	})
+
+	// nodeChangedPredicate triggers only when node labels or Ready condition changes.
+	nodeChangedPredicate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNode, ok1 := e.ObjectOld.(*corev1.Node)
+			newNode, ok2 := e.ObjectNew.(*corev1.Node)
+			if !ok1 || !ok2 {
+				return false
+			}
+			if !labelsEqual(oldNode.Labels, newNode.Labels) {
+				return true
+			}
+			return nodeReadyStatusChanged(oldNode, newNode)
+		},
+		CreateFunc:  func(event.CreateEvent) bool { return true },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.SandboxSnapshot{}).
 		Owns(&runtimev1alpha1.SandboxSnapshotTask{}).
 		Owns(&sandboxv1alpha1.Sandbox{}).
+		Watches(&extensionsv1alpha1.SandboxTemplate{}, templateToSnapshotMapper,
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(&corev1.Node{}, nodeToSnapshotMapper,
+			builder.WithPredicates(nodeChangedPredicate)).
 		Complete(r)
+}
+
+func labelsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func nodeReadyStatusChanged(old, new *corev1.Node) bool {
+	oldReady := nodeIsReady(old)
+	newReady := nodeIsReady(new)
+	return oldReady != newReady
 }

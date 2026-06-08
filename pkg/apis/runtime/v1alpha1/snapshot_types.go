@@ -97,12 +97,22 @@ type SandboxSnapshotSpec struct {
 }
 
 // SandboxSnapshotMode selects the snapshot usage mode.
-// +kubebuilder:validation:Enum=Fork
+// +kubebuilder:validation:Enum=Fork;Resume
+//
+// Phase 1 implements Fork only. Resume is accepted by the API but the controller
+// returns "unsupported snapshotMode" until Phase 2. An admission webhook validating
+// SnapshotClass.supportedSnapshotModes compatibility is planned but not yet implemented.
 type SandboxSnapshotMode string
 
 const (
 	// SandboxSnapshotModeFork creates a reusable baseline for 1:N forking.
+	// The snapshot is taken once and restored for each new session.
 	SandboxSnapshotModeFork SandboxSnapshotMode = "Fork"
+
+	// SandboxSnapshotModeResume restores a prior session's execution state.
+	// Not implemented in Phase 1; the controller rejects Resume snapshots
+	// with an "unsupported snapshotMode" error.
+	SandboxSnapshotModeResume SandboxSnapshotMode = "Resume"
 )
 
 // SandboxSnapshotForkPolicy describes when a Fork snapshot is rebuilt.
@@ -250,28 +260,14 @@ type SandboxSnapshotTaskList struct {
 	Items           []SandboxSnapshotTask `json:"items"`
 }
 
-// Annotation keys used for snapshot restore intent on session Sandboxes.
+// Annotation and label keys for snapshot restore intent on session Sandboxes.
 const (
-	// SnapshotKeyAnnotation is set on a session Sandbox to request restore from the
-	// given snapshot key during Pod sandbox creation.
+	// SnapshotKeyAnnotation is set on a session Sandbox's pod template to request
+	// restore from the given snapshot key during VM startup.
 	SnapshotKeyAnnotation = "agentcube.volcano.sh/snapshot-key"
-)
 
-// Label keys used for snapshot build tracking.
-const (
-	// SnapshotNameLabelKey identifies the owning SandboxSnapshot for build Sandboxes and tasks.
-	SnapshotNameLabelKey = "agentcube.volcano.sh/snapshot-name"
-	// SnapshotKeyLabelKey identifies the snapshot key version for idempotent task lookup.
-	SnapshotKeyLabelKey = "agentcube.volcano.sh/snapshot-key"
-	// SnapshotNodeLabelKey identifies the target node for build Sandboxes and tasks.
-	SnapshotNodeLabelKey = "agentcube.volcano.sh/snapshot-node"
-	// SnapshotBuildLabelKey marks a Sandbox as a temporary fork-mode build sandbox.
-	SnapshotBuildLabelKey = "agentcube.volcano.sh/snapshot-build"
-)
-
-// Node label key used to advertise snapshot provider capability.
-const (
-	// SnapshotProviderLabelPrefix is prepended by the provider name to form a node label.
+	// SnapshotProviderLabelPrefix is prepended by the provider name to form a node label
+	// advertising provider capability.
 	// Example: agentcube.volcano.sh/snapshot-provider.snapstart.kuasar.io=true
 	SnapshotProviderLabelPrefix = "agentcube.volcano.sh/snapshot-provider."
 )

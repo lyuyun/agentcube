@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package agentd
+package driver
 
 import (
 	"context"
@@ -41,10 +41,10 @@ import (
 func AdvertiseDriverCapabilities(ctx context.Context, cs kubernetes.Interface, nodeName string, drivers map[string]SnapshotDriver) error {
 	// Build the desired provider label set.
 	desired := make(map[string]string, len(drivers))
-	for _, driver := range drivers {
-		caps := driver.Capabilities(ctx)
+	for _, d := range drivers {
+		caps := d.Capabilities(ctx)
 		if len(caps.SnapshotModes) > 0 {
-			desired[runtimev1alpha1.SnapshotProviderLabelPrefix+driver.Name()] = "true"
+			desired[runtimev1alpha1.SnapshotProviderLabelPrefix+d.Name()] = "true"
 		}
 	}
 

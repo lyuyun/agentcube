@@ -73,9 +73,12 @@ spec:
                   the provider and placement.
                 type: string
               snapshotMode:
-                description: SnapshotMode selects the usage mode.
+                description: SnapshotMode selects the usage mode. Fork is implemented
+                  in Phase 1; Resume is accepted by the API but not yet implemented
+                  in the controller.
                 enum:
                 - Fork
+                - Resume
                 type: string
               sourceRef:
                 description: SourceRef references the source SandboxTemplate for the
