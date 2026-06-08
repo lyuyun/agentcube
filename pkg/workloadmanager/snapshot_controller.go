@@ -116,8 +116,8 @@ func (r *SandboxSnapshotReconciler) reconcileWithHandler(ctx context.Context, ss
 	}
 
 	if manifest.PendingSetRef.SnapshotKey != "" {
-		pending := manifest.ArtifactSets[manifest.PendingSetRef.SnapshotKey]
-		if handler.ReadyToPromote(pending) {
+		pending, ok := manifest.ArtifactSets[manifest.PendingSetRef.SnapshotKey]
+		if ok && handler.ReadyToPromote(pending) {
 			logger.Info("promoting pending artifact set to active", "snapshot", ss.Name, "snapshotKey", pending.SnapshotKey)
 			if manifest.ActiveSetRef.SnapshotKey != "" {
 				delete(manifest.ArtifactSets, manifest.ActiveSetRef.SnapshotKey)
@@ -190,11 +190,8 @@ func (r *SandboxSnapshotReconciler) reconcileTasksAndArtifacts(ctx context.Conte
 func (r *SandboxSnapshotReconciler) cleanupCompletedTasks(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, snapshotKey string, handler SnapshotModeHandler) {
 	logger := log.FromContext(ctx)
 
-	taskList := &runtimev1alpha1.SandboxSnapshotTaskList{}
-	if err := r.List(ctx, taskList, client.InNamespace(ss.Namespace), client.MatchingLabels{
-		runtimev1alpha1.SnapshotNameLabelKey: ss.Name,
-		runtimev1alpha1.SnapshotKeyLabelKey:  snapshotKey,
-	}); err != nil {
+	taskList, err := r.listSnapshotTasks(ctx, ss, snapshotKey)
+	if err != nil {
 		logger.Error(err, "list completed tasks for cleanup")
 		return
 	}
@@ -202,7 +199,9 @@ func (r *SandboxSnapshotReconciler) cleanupCompletedTasks(ctx context.Context, s
 	for i := range taskList.Items {
 		task := &taskList.Items[i]
 		phase := task.Status.Phase
-		if phase != runtimev1alpha1.SnapshotArtifactPhaseReady && phase != runtimev1alpha1.SnapshotArtifactPhaseFailed {
+		if phase != runtimev1alpha1.SnapshotArtifactPhaseReady &&
+			phase != runtimev1alpha1.SnapshotArtifactPhaseFailed &&
+			phase != runtimev1alpha1.SnapshotArtifactPhaseUnavailable {
 			continue
 		}
 		if err := handler.CleanupTask(ctx, ss, task); err != nil {
@@ -214,15 +213,25 @@ func (r *SandboxSnapshotReconciler) cleanupCompletedTasks(ctx context.Context, s
 	}
 }
 
+// taskSnapshotRefIndexKey is the field index used to look up SandboxSnapshotTasks by
+// their owning SandboxSnapshot name.
+const taskSnapshotRefIndexKey = "spec.snapshotRef.name"
+
 func (r *SandboxSnapshotReconciler) listSnapshotTasks(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, snapshotKey string) (*runtimev1alpha1.SandboxSnapshotTaskList, error) {
-	taskList := &runtimev1alpha1.SandboxSnapshotTaskList{}
-	if err := r.List(ctx, taskList, client.InNamespace(ss.Namespace), client.MatchingLabels{
-		runtimev1alpha1.SnapshotNameLabelKey: ss.Name,
-		runtimev1alpha1.SnapshotKeyLabelKey:  snapshotKey,
-	}); err != nil {
+	all := &runtimev1alpha1.SandboxSnapshotTaskList{}
+	if err := r.List(ctx, all, client.InNamespace(ss.Namespace),
+		client.MatchingFields{taskSnapshotRefIndexKey: ss.Name},
+	); err != nil {
 		return nil, fmt.Errorf("list snapshot tasks: %w", err)
 	}
-	return taskList, nil
+	// Filter to the active snapshotKey in-memory; the field index scopes to owner only.
+	filtered := &runtimev1alpha1.SandboxSnapshotTaskList{}
+	for i := range all.Items {
+		if all.Items[i].Spec.SnapshotKey == snapshotKey {
+			filtered.Items = append(filtered.Items, all.Items[i])
+		}
+	}
+	return filtered, nil
 }
 
 func (r *SandboxSnapshotReconciler) syncArtifactStatus(ctx context.Context, manifest *store.SnapshotArtifactManifest, ownerKey, rawVersion, workingKey string, artifactSet store.SnapshotArtifactSet, taskList *runtimev1alpha1.SandboxSnapshotTaskList) (string, store.SnapshotArtifactSet, error) {
@@ -363,7 +372,10 @@ func saveManifest(ctx context.Context, as store.ArtifactStore, ownerKey string, 
 		}
 		return version, fmt.Errorf("put artifact manifest: %w", err)
 	}
-	raw, _ := json.Marshal(manifest)
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		return version, fmt.Errorf("marshal manifest for version token: %w", err)
+	}
 	return string(raw), nil
 }
 
@@ -384,7 +396,17 @@ func startNewArtifactSet(ss *runtimev1alpha1.SandboxSnapshot, manifest *store.Sn
 
 func buildSnapshotKey(ss *runtimev1alpha1.SandboxSnapshot, rebuildSeq int32) string {
 	mode := strings.ToLower(string(ss.Spec.SnapshotMode))
-	return fmt.Sprintf("%s-%s-g%d-r%d", normalizeLabel(ss.Name), mode, ss.Generation, rebuildSeq)
+	// Build suffix first so we know how many chars are left for the name prefix.
+	// The full key is used as a label value and must not exceed 63 characters.
+	suffix := fmt.Sprintf("-%s-g%d-r%d", mode, ss.Generation, rebuildSeq)
+	name := normalizeLabel(ss.Name)
+	if maxLen := 63 - len(suffix); len(name) > maxLen {
+		if maxLen < 0 {
+			maxLen = 0
+		}
+		name = strings.TrimRight(name[:maxLen], "-")
+	}
+	return name + suffix
 }
 
 func normalizeLabel(s string) string {
@@ -474,6 +496,9 @@ func containsMode(modes []runtimev1alpha1.SandboxSnapshotMode, mode runtimev1alp
 	return false
 }
 
+// snapshotSourceRefIndexKey is the field index used to look up SandboxSnapshots by sourceRef name.
+const snapshotSourceRefIndexKey = "spec.sourceRef.name"
+
 // SetupWithManager registers the controller and initializes mode handlers.
 func (r *SandboxSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorderFor("sandbox-snapshot-controller")
@@ -484,6 +509,18 @@ func (r *SandboxSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			Recorder:      r.Recorder,
 			Scheme:        mgr.GetScheme(),
 		},
+	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &runtimev1alpha1.SandboxSnapshot{}, snapshotSourceRefIndexKey, func(obj client.Object) []string {
+		ss := obj.(*runtimev1alpha1.SandboxSnapshot)
+		return []string{ss.Spec.SourceRef.Name}
+	}); err != nil {
+		return fmt.Errorf("setup sourceRef field index: %w", err)
+	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &runtimev1alpha1.SandboxSnapshotTask{}, taskSnapshotRefIndexKey, func(obj client.Object) []string {
+		task := obj.(*runtimev1alpha1.SandboxSnapshotTask)
+		return []string{task.Spec.SnapshotRef.Name}
+	}); err != nil {
+		return fmt.Errorf("setup task snapshotRef field index: %w", err)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.SandboxSnapshot{}).

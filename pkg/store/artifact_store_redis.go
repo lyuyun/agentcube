@@ -27,8 +27,8 @@ import (
 
 // redisArtifactStore implements ArtifactStore using Redis.
 // The compare-and-set is implemented with WATCH + MULTI/EXEC. The version token
-// is a JSON encoding of the raw string value, so the caller can pass it back
-// unchanged. An empty string means "no previous value".
+// is the raw string value stored in Redis; the caller passes it back unchanged.
+// An empty string means "no previous value".
 type redisArtifactStore struct {
 	cli *redisv9.Client
 }

@@ -265,6 +265,15 @@ func (d *KuasarDriver) readResponse(rd *bufio.Reader) (*kuasarResponse, error) {
 	return resp, nil
 }
 
+// Restore triggers a WarmFork restore for a new session Sandbox via the Kuasar admin socket.
+//
+// TODO(maintainer): implement Kuasar fork-restore protocol once wire format is stabilized.
+// Expected sequence: CAPABILITIES -> FORK (snapshotKey, sandboxID) -> STARTED.
+func (d *KuasarDriver) Restore(_ context.Context, req SnapshotDriverRestoreRequest) error {
+	return fmt.Errorf("kuasar restore not yet implemented (snapshotKey=%s, sandbox=%s/%s)",
+		req.SnapshotKey, req.Namespace, req.SandboxName)
+}
+
 func (d *KuasarDriver) sendDeleteCommand(_ context.Context, conn net.Conn, snapshotKey string) error {
 	return d.sendCommand(conn, kuasarCommand{Action: "DELETE", SnapshotKey: snapshotKey})
 }

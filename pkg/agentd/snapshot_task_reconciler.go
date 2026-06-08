@@ -60,7 +60,8 @@ func (r *SnapshotTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Skip tasks that have already reached a terminal phase.
 	if task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseReady ||
-		task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseFailed {
+		task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseFailed ||
+		task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseUnavailable {
 		return ctrl.Result{}, nil
 	}
 

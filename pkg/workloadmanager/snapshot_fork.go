@@ -105,7 +105,7 @@ func (h *ForkModeHandler) EnsureTasks(ctx context.Context, ss *runtimev1alpha1.S
 }
 
 func (h *ForkModeHandler) ReadyToPromote(pending store.SnapshotArtifactSet) bool {
-	return allNodeArtifactsReady(pending.Artifacts)
+	return anyNodeArtifactReady(pending.Artifacts)
 }
 
 func (h *ForkModeHandler) CleanupTask(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, task *runtimev1alpha1.SandboxSnapshotTask) error {
@@ -126,18 +126,30 @@ func (h *ForkModeHandler) CleanupTask(ctx context.Context, ss *runtimev1alpha1.S
 func (h *ForkModeHandler) CleanupAll(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot) error {
 	sandboxList := &sandboxv1alpha1.SandboxList{}
 	if err := h.Client.List(ctx, sandboxList, client.InNamespace(ss.Namespace), client.MatchingLabels{
-		runtimev1alpha1.SnapshotNameLabelKey:  ss.Name,
-		runtimev1alpha1.SnapshotBuildLabelKey: "true",
+		runtimev1alpha1.SnapshotTemplateSandboxLabelKey: "true",
 	}); err != nil {
 		return fmt.Errorf("list build sandboxes: %w", err)
 	}
 	for i := range sandboxList.Items {
 		sb := &sandboxList.Items[i]
+		if !isOwnedBy(sb, ss.UID) {
+			continue
+		}
 		if err := h.Client.Delete(ctx, sb); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete build sandbox %s: %w", sb.Name, err)
 		}
 	}
 	return nil
+}
+
+// isOwnedBy reports whether obj carries an ownerReference with the given UID.
+func isOwnedBy(obj client.Object, ownerUID types.UID) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.UID == ownerUID {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *ForkModeHandler) clearStaleActiveSet(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, manifest *store.SnapshotArtifactManifest, ownerKey, rawVersion, currentHash string) (string, error) {
@@ -223,11 +235,7 @@ func (h *ForkModeHandler) ensureBuildSandboxAndTask(ctx context.Context, ss *run
 	}
 
 	task := &runtimev1alpha1.SandboxSnapshotTask{
-		ObjectMeta: metaWithLabels(taskName, ss.Namespace, map[string]string{
-			runtimev1alpha1.SnapshotNameLabelKey: ss.Name,
-			runtimev1alpha1.SnapshotKeyLabelKey:  snapshotKey,
-			runtimev1alpha1.SnapshotNodeLabelKey: nodeName,
-		}),
+		ObjectMeta: metaWithLabels(taskName, ss.Namespace, nil),
 		Spec: runtimev1alpha1.SandboxSnapshotTaskSpec{
 			SnapshotRef: corev1.TypedLocalObjectReference{
 				APIGroup: ptr.To(runtimev1alpha1.GroupVersion.Group),
@@ -269,10 +277,7 @@ func (h *ForkModeHandler) ensureBuildSandbox(ctx context.Context, ss *runtimev1a
 
 		buildSandbox = &sandboxv1alpha1.Sandbox{
 			ObjectMeta: metaWithLabels(sbName, ss.Namespace, map[string]string{
-				runtimev1alpha1.SnapshotNameLabelKey:  ss.Name,
-				runtimev1alpha1.SnapshotKeyLabelKey:   snapshotKey,
-				runtimev1alpha1.SnapshotNodeLabelKey:  nodeName,
-				runtimev1alpha1.SnapshotBuildLabelKey: "true",
+				runtimev1alpha1.SnapshotTemplateSandboxLabelKey: "true",
 			}),
 			Spec: sandboxv1alpha1.SandboxSpec{
 				PodTemplate: sandboxv1alpha1.PodTemplate{Spec: *podSpec},
@@ -303,16 +308,13 @@ func forkRebuildsOnSourceChange(ss *runtimev1alpha1.SandboxSnapshot) bool {
 	return *ss.Spec.ForkPolicy.RebuildOnSourceChange
 }
 
-func allNodeArtifactsReady(artifacts []store.SnapshotArtifact) bool {
-	if len(artifacts) == 0 {
-		return false
-	}
+func anyNodeArtifactReady(artifacts []store.SnapshotArtifact) bool {
 	for _, a := range artifacts {
-		if a.Phase != store.SnapshotArtifactPhaseReady {
-			return false
+		if a.Phase == store.SnapshotArtifactPhaseReady {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 func coveredArtifactNodes(artifacts []store.SnapshotArtifact) map[string]struct{} {
@@ -389,7 +391,30 @@ func normalizePodSpec(spec corev1.PodSpec) corev1.PodSpec {
 	s := spec.DeepCopy()
 	s.NodeName = ""
 	sort.Slice(s.Tolerations, func(i, j int) bool {
-		return s.Tolerations[i].Key < s.Tolerations[j].Key
+		a, b := s.Tolerations[i], s.Tolerations[j]
+		if a.Key != b.Key {
+			return a.Key < b.Key
+		}
+		if a.Operator != b.Operator {
+			return a.Operator < b.Operator
+		}
+		if a.Value != b.Value {
+			return a.Value < b.Value
+		}
+		if a.Effect != b.Effect {
+			return a.Effect < b.Effect
+		}
+		// nil and ptr(0) both evaluate to 0 but marshal differently;
+		// treat nil < non-nil so the sort order is fully deterministic.
+		aNil := a.TolerationSeconds == nil
+		bNil := b.TolerationSeconds == nil
+		if aNil != bNil {
+			return aNil
+		}
+		if !aNil {
+			return *a.TolerationSeconds < *b.TolerationSeconds
+		}
+		return false
 	})
 	return *s
 }
@@ -402,10 +427,11 @@ func metaWithLabels(name, namespace string, lbls map[string]string) metav1.Objec
 	}
 }
 
-// lookupActiveForkSnapshotKey returns the active snapshot key for a Fork-mode SandboxSnapshot
-// whose sourceRef matches sandboxTemplateName, or an empty string when none is Ready.
-// Errors from the artifact store are logged and treated as cache-miss so session creation
-// falls back to cold start rather than failing.
+// lookupActiveForkSnapshotKey returns the active snapshot key for a Fork-mode
+// SandboxSnapshot whose sourceRef matches sandboxTemplateName.
+// Returns an empty string when no Ready artifact is found.
+// Errors from the artifact store are logged and treated as cache-miss so session
+// creation falls back to cold start rather than failing.
 func lookupActiveForkSnapshotKey(
 	ctx context.Context,
 	k8sClient client.Client,
@@ -413,18 +439,23 @@ func lookupActiveForkSnapshotKey(
 	namespace, sandboxTemplateName string,
 ) string {
 	snapshotList := &runtimev1alpha1.SandboxSnapshotList{}
-	if err := k8sClient.List(ctx, snapshotList, client.InNamespace(namespace)); err != nil {
+	if err := k8sClient.List(ctx, snapshotList,
+		client.InNamespace(namespace),
+		client.MatchingFields{snapshotSourceRefIndexKey: sandboxTemplateName},
+	); err != nil {
 		klog.V(4).InfoS("snapshot lookup: failed to list snapshots, falling back to cold start",
 			"namespace", namespace, "error", err)
 		return ""
 	}
 
+	// Prefer the most recently created snapshot when multiple match.
+	sort.Slice(snapshotList.Items, func(i, j int) bool {
+		return snapshotList.Items[j].CreationTimestamp.Before(&snapshotList.Items[i].CreationTimestamp)
+	})
+
 	for i := range snapshotList.Items {
 		ss := &snapshotList.Items[i]
 		if ss.Spec.SnapshotMode != runtimev1alpha1.SandboxSnapshotModeFork {
-			continue
-		}
-		if ss.Spec.SourceRef.Name != sandboxTemplateName {
 			continue
 		}
 		if ss.Status.Phase != runtimev1alpha1.SandboxSnapshotPhaseReady {
@@ -445,12 +476,11 @@ func lookupActiveForkSnapshotKey(
 		if !ok {
 			continue
 		}
-		for _, art := range activeSet.Artifacts {
-			if art.Phase == store.SnapshotArtifactPhaseReady {
-				klog.V(4).InfoS("snapshot lookup: found active fork snapshot key",
-					"snapshot", ss.Name, "snapshotKey", manifest.ActiveSetRef.SnapshotKey)
-				return manifest.ActiveSetRef.SnapshotKey
-			}
+
+		if anyNodeArtifactReady(activeSet.Artifacts) {
+			klog.V(4).InfoS("snapshot lookup: found active fork snapshot key",
+				"snapshot", ss.Name, "snapshotKey", manifest.ActiveSetRef.SnapshotKey)
+			return manifest.ActiveSetRef.SnapshotKey
 		}
 	}
 	return ""

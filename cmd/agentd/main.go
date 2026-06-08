@@ -56,16 +56,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = ctrl.NewControllerManagedBy(mgr).
-		For(&sandboxv1alpha1.Sandbox{}).
-		Complete(&agentd.Reconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
-		}); err != nil {
-		fmt.Fprintf(os.Stderr, "unable to create sandbox controller: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Read the node name from the downward API environment variable.
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
@@ -79,6 +69,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = ctrl.NewControllerManagedBy(mgr).
+		For(&sandboxv1alpha1.Sandbox{}).
+		Complete(&agentd.Reconciler{
+			Client:  mgr.GetClient(),
+			Scheme:  mgr.GetScheme(),
+			Drivers: registry.Drivers(),
+		}); err != nil {
+		fmt.Fprintf(os.Stderr, "unable to create sandbox controller: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Advertise snapshot capabilities on the node before controllers start so that
 	// the workload manager can select this node for snapshot builds immediately.
 	cs, err := kubernetes.NewForConfig(mgr.GetConfig())
@@ -86,7 +87,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unable to create kubernetes client: %v\n", err)
 		os.Exit(1)
 	}
-	if err := agentd.AdvertiseDriverCapabilities(ctrl.SetupSignalHandler(), cs, nodeName, registry.Drivers()); err != nil {
+	ctx := ctrl.SetupSignalHandler()
+	if err := agentd.AdvertiseDriverCapabilities(ctx, cs, nodeName, registry.Drivers()); err != nil {
 		fmt.Fprintf(os.Stderr, "unable to advertise driver capabilities: %v\n", err)
 		os.Exit(1)
 	}
@@ -102,7 +104,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "problem running manager: %v\n", err)
 		os.Exit(1)
 	}

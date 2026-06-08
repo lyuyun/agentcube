@@ -49,6 +49,28 @@ type SnapshotDriver interface {
 
 	// Inspect returns the current status of an artifact.
 	Inspect(ctx context.Context, artifact SnapshotDriverArtifact) (*SnapshotDriverArtifactStatus, error)
+
+	// Restore triggers a fork from the named snapshot for a new session Sandbox.
+	// It must complete before the session Sandbox VM starts.
+	// Implementations MUST be idempotent: a second call for the same sandbox must
+	// succeed or return an error that the caller can safely absorb.
+	// On error the caller allows a cold-start fallback.
+	Restore(ctx context.Context, req SnapshotDriverRestoreRequest) error
+}
+
+// SnapshotDriverRestoreRequest carries the inputs for a snapshot restore call.
+type SnapshotDriverRestoreRequest struct {
+	// SandboxName is the name of the session Sandbox being started.
+	SandboxName string
+
+	// Namespace is the namespace of the session Sandbox.
+	Namespace string
+
+	// SnapshotKey is the logical restore reference from the annotation.
+	SnapshotKey string
+
+	// SnapshotMode is the snapshot mode (Fork or Resume).
+	SnapshotMode runtimev1alpha1.SandboxSnapshotMode
 }
 
 // SnapshotDriverCapabilities describes what a driver can do.
