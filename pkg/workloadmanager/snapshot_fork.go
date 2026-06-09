@@ -471,14 +471,14 @@ func (h *ForkModeHandler) ensureBuildSandboxAndTask(ctx context.Context, ss *run
 			return false, nil
 		}
 		// Non-terminal task already exists; just ensure the build sandbox is present.
-		_, err = h.ensureBuildSandbox(ctx, ss, snapshotKey, nodeName, sbName)
+		_, err = h.ensureBuildSandbox(ctx, ss, sc, snapshotKey, nodeName, sbName)
 		return false, err
 	}
 	if !apierrors.IsNotFound(err) {
 		return false, fmt.Errorf("get snapshot task %s: %w", taskName, err)
 	}
 
-	buildSandbox, err := h.ensureBuildSandbox(ctx, ss, snapshotKey, nodeName, sbName)
+	buildSandbox, err := h.ensureBuildSandbox(ctx, ss, sc, snapshotKey, nodeName, sbName)
 	if err != nil {
 		return false, err
 	}
@@ -513,7 +513,7 @@ func (h *ForkModeHandler) ensureBuildSandboxAndTask(ctx context.Context, ss *run
 	return true, nil
 }
 
-func (h *ForkModeHandler) ensureBuildSandbox(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, snapshotKey, nodeName, sbName string) (*sandboxv1alpha1.Sandbox, error) {
+func (h *ForkModeHandler) ensureBuildSandbox(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, sc *runtimev1alpha1.SnapshotClass, snapshotKey, nodeName, sbName string) (*sandboxv1alpha1.Sandbox, error) {
 	buildSandbox := &sandboxv1alpha1.Sandbox{}
 	err := h.Client.Get(ctx, types.NamespacedName{Name: sbName, Namespace: ss.Namespace}, buildSandbox)
 	if apierrors.IsNotFound(err) {
@@ -523,29 +523,49 @@ func (h *ForkModeHandler) ensureBuildSandbox(ctx context.Context, ss *runtimev1a
 		}
 		podSpec := tmpl.Spec.PodTemplate.Spec.DeepCopy()
 		podSpec.NodeName = nodeName
-		// Signal the runtime to reach a fork-safe point before reporting readiness to the driver.
+		// Signal the runtime to install its session gate: hold all user requests
+		// until session injection is complete via the inject socket handshake.
 		for i := range podSpec.Containers {
 			podSpec.Containers[i].Env = append(podSpec.Containers[i].Env, corev1.EnvVar{
-				Name:  "AGENTCUBE_SNAPSTART_BUILD_MODE",
+				Name:  "AGENTCUBE_SESSION_GATE",
 				Value: "true",
 			})
+		}
+
+		// Copy pod template metadata from the source template, then merge
+		// SnapshotClass.BuildPodAnnotations on top. This keeps provider-specific
+		// annotations (e.g. kuasar.io/*) out of the workload manager's code.
+		podMeta := tmpl.Spec.PodTemplate.ObjectMeta.DeepCopy()
+		if len(sc.Spec.BuildPodAnnotations) > 0 {
+			if podMeta.Annotations == nil {
+				podMeta.Annotations = make(map[string]string, len(sc.Spec.BuildPodAnnotations))
+			}
+			for k, v := range sc.Spec.BuildPodAnnotations {
+				podMeta.Annotations[k] = v
+			}
 		}
 
 		buildSandbox = &sandboxv1alpha1.Sandbox{
 			ObjectMeta: metaWithLabels(sbName, ss.Namespace, nil),
 			Spec: sandboxv1alpha1.SandboxSpec{
-				PodTemplate: sandboxv1alpha1.PodTemplate{Spec: *podSpec},
-				Replicas:    ptr.To[int32](1),
+				PodTemplate: sandboxv1alpha1.PodTemplate{
+					Spec:       *podSpec,
+					ObjectMeta: *podMeta,
+				},
+				Replicas: ptr.To[int32](1),
 			},
 		}
 		if err := controllerutil.SetControllerReference(ss, buildSandbox, h.Scheme); err != nil {
 			return nil, fmt.Errorf("set controller reference on build sandbox: %w", err)
 		}
-		if err := h.Client.Create(ctx, buildSandbox); err != nil && !apierrors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("create build sandbox %s: %w", sbName, err)
-		}
-		if err := h.Client.Get(ctx, types.NamespacedName{Name: sbName, Namespace: ss.Namespace}, buildSandbox); err != nil {
-			return nil, fmt.Errorf("re-fetch build sandbox: %w", err)
+		if err := h.Client.Create(ctx, buildSandbox); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return nil, fmt.Errorf("create build sandbox %s: %w", sbName, err)
+			}
+			// AlreadyExists: a concurrent reconcile created the sandbox; re-fetch its server state.
+			if err := h.Client.Get(ctx, types.NamespacedName{Name: sbName, Namespace: ss.Namespace}, buildSandbox); err != nil {
+				return nil, fmt.Errorf("re-fetch build sandbox: %w", err)
+			}
 		}
 	} else if err != nil {
 		return nil, fmt.Errorf("get build sandbox %s: %w", sbName, err)
@@ -630,6 +650,8 @@ func nodeIsReady(node *corev1.Node) bool {
 }
 
 // snapshotHashInput is the stable serialization for hash computation.
+// Note: source PodTemplate.ObjectMeta (labels/annotations) is intentionally
+// excluded; provider-affecting annotations belong in SnapshotClass.BuildPodAnnotations.
 type snapshotHashInput struct {
 	SnapshotMode    string            `json:"snapshotMode"`
 	SourceNamespace string            `json:"sourceNamespace"`
@@ -640,8 +662,9 @@ type snapshotHashInput struct {
 }
 
 type snapshotClassHash struct {
-	Name         string `json:"name"`
-	ProviderName string `json:"providerName"`
+	Name                string            `json:"name"`
+	ProviderName        string            `json:"providerName"`
+	BuildPodAnnotations map[string]string `json:"buildPodAnnotations,omitempty"`
 }
 
 func computeSnapshotHash(ss *runtimev1alpha1.SandboxSnapshot, sourceUID types.UID, podSpec corev1.PodSpec, sc *runtimev1alpha1.SnapshotClass) (string, error) {
@@ -652,8 +675,9 @@ func computeSnapshotHash(ss *runtimev1alpha1.SandboxSnapshot, sourceUID types.UI
 		SourceUID:       string(sourceUID),
 		PodTemplateSpec: normalizePodSpec(podSpec),
 		SnapshotClass: snapshotClassHash{
-			Name:         sc.Name,
-			ProviderName: sc.Spec.ProviderName,
+			Name:                sc.Name,
+			ProviderName:        sc.Spec.ProviderName,
+			BuildPodAnnotations: sc.Spec.BuildPodAnnotations,
 		},
 	}
 	data, err := json.Marshal(input)

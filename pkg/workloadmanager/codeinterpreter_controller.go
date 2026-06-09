@@ -22,7 +22,6 @@ import (
 	"reflect"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -260,51 +259,18 @@ func (r *CodeInterpreterReconciler) deleteSandboxWarmPool(ctx context.Context, c
 	return nil
 }
 
-// convertToPodTemplate converts CodeInterpreterSandboxTemplate to sandboxv1alpha1.PodTemplate
+// convertToPodTemplate converts CodeInterpreterSandboxTemplate to sandboxv1alpha1.PodTemplate.
+// Delegates to buildCodeInterpreterPodTemplate so that the SandboxTemplate and the
+// session Sandbox are always produced by the same logic.
 func (r *CodeInterpreterReconciler) convertToPodTemplate(template *runtimev1alpha1.CodeInterpreterSandboxTemplate, ci *runtimev1alpha1.CodeInterpreter) sandboxv1alpha1.PodTemplate {
-	// Normalize RuntimeClassName: if it's an empty string, set it to nil
-	runtimeClassName := template.RuntimeClassName
-	if runtimeClassName != nil && *runtimeClassName == "" {
-		runtimeClassName = nil
-	}
-
-	// Build environment variables - create a copy to avoid mutating the cached object
-	envVars := make([]corev1.EnvVar, len(template.Environment))
-	copy(envVars, template.Environment)
-	// Only inject public key for picod auth mode (default behavior)
-	if ci.Spec.AuthMode != runtimev1alpha1.AuthModeNone {
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "PICOD_AUTH_PUBLIC_KEY",
-			Value: GetCachedPublicKey(),
-		})
-	}
-
-	// Build pod spec
-	podSpec := corev1.PodSpec{
-		ImagePullSecrets: template.ImagePullSecrets,
-		Containers: []corev1.Container{
-			{
-				Name:            "codeinterpreter",
-				Image:           template.Image,
-				ImagePullPolicy: template.ImagePullPolicy,
-				Command:         template.Command,
-				Args:            template.Args,
-				Env:             envVars,
-				Resources:       template.Resources,
-			},
-		},
-		RuntimeClassName: runtimeClassName,
-	}
-
-	return sandboxv1alpha1.PodTemplate{
-		Spec: podSpec,
-	}
+	return buildCodeInterpreterPodTemplate(template, ci.Spec.AuthMode)
 }
 
-// podTemplateEqual checks if two PodTemplates are equal
+// podTemplateEqual reports whether two PodTemplates are equal, comparing both
+// the pod spec and the pod-level metadata (labels and annotations).
 func (r *CodeInterpreterReconciler) podTemplateEqual(a, b sandboxv1alpha1.PodTemplate) bool {
-	// Use reflect.DeepEqual for a comprehensive comparison.
-	return reflect.DeepEqual(a.Spec, b.Spec)
+	return reflect.DeepEqual(a.Spec, b.Spec) &&
+		reflect.DeepEqual(a.ObjectMeta, b.ObjectMeta)
 }
 
 // SetupWithManager sets up the controller with the Manager.

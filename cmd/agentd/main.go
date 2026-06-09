@@ -24,8 +24,10 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/klog/v2"
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/volcano-sh/agentcube/pkg/agentd"
@@ -47,6 +49,9 @@ func init() {
 }
 
 func main() {
+	klog.InitFlags(nil)
+	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: schemeBuilder,
 		Metrics: metricsserver.Options{

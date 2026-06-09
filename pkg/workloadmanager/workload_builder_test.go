@@ -294,6 +294,68 @@ func assertOwnerReference(t *testing.T, owner metav1.OwnerReference) {
 	}
 }
 
+// TestBuildCodeInterpreterPodTemplate_SnapstartIsolation verifies the Phase-1 isolation
+// properties of the CodeInterpreter pod template used for both the SandboxTemplate
+// (SnapStart fork source) and session Sandboxes (cold-start and Fork restore paths).
+func TestBuildCodeInterpreterPodTemplate_SnapstartIsolation(t *testing.T) {
+	setCachedPublicKeyForTest(t, "static-router-public-key")
+
+	tmpl := &runtimev1alpha1.CodeInterpreterSandboxTemplate{
+		Image: "python:3.11",
+		Environment: []corev1.EnvVar{
+			{Name: "CUSTOM_VAR", Value: "custom-value"},
+		},
+		Labels:      map[string]string{"app": "ci"},
+		Annotations: map[string]string{"meta": "data"},
+	}
+
+	pt := buildCodeInterpreterPodTemplate(tmpl, runtimev1alpha1.AuthModePicoD)
+
+	if len(pt.Spec.Containers) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(pt.Spec.Containers))
+	}
+
+	// Container name must use the canonical constant so that SnapStart fork sources
+	// and restore targets agree.
+	if pt.Spec.Containers[0].Name != codeInterpreterContainerName {
+		t.Errorf("container name: expected %q, got %q", codeInterpreterContainerName, pt.Spec.Containers[0].Name)
+	}
+
+	envMap := make(map[string]string)
+	for _, e := range pt.Spec.Containers[0].Env {
+		envMap[e.Name] = e.Value
+	}
+
+	// AGENTCUBE_SESSION_GATE must NOT appear in the session Sandbox template.
+	// Restore sessions get sessionGate=true from the snapshot's process memory and run
+	// the WarmFork handshake without this env var in the PodSpec.
+	// Cold-start sessions (no active snapshot) must NOT block on the WarmFork handshake;
+	// if this env var were here, every cold-start session would wait for Kuasar.
+	if _, found := envMap["AGENTCUBE_SESSION_GATE"]; found {
+		t.Error("AGENTCUBE_SESSION_GATE must not be in the session Sandbox template")
+	}
+
+	// PICOD_AUTH_PUBLIC_KEY is the static router public key used to verify per-request
+	// JWTs. It is not session-specific: all sessions of the same CodeInterpreter share
+	// the same key. On the Fork-restore path this value is already loaded in the
+	// snapshot's process memory; the PodSpec entry is kept for cold-start compatibility.
+	if envMap["PICOD_AUTH_PUBLIC_KEY"] != "static-router-public-key" {
+		t.Errorf("PICOD_AUTH_PUBLIC_KEY: expected %q, got %q", "static-router-public-key", envMap["PICOD_AUTH_PUBLIC_KEY"])
+	}
+
+	// Template labels/annotations must appear in pod ObjectMeta so operator-defined
+	// metadata is propagated to the pod on both the SnapStart and cold-start paths.
+	if envMap["CUSTOM_VAR"] != "custom-value" {
+		t.Errorf("CUSTOM_VAR: expected %q, got %q", "custom-value", envMap["CUSTOM_VAR"])
+	}
+	if pt.ObjectMeta.Labels["app"] != "ci" {
+		t.Errorf("label app: expected %q, got %q", "ci", pt.ObjectMeta.Labels["app"])
+	}
+	if pt.ObjectMeta.Annotations["meta"] != "data" {
+		t.Errorf("annotation meta: expected %q, got %q", "data", pt.ObjectMeta.Annotations["meta"])
+	}
+}
+
 func TestBuildCodeInterpreterEnvVars(t *testing.T) {
 	setCachedPublicKeyForTest(t, "test-public-key")
 

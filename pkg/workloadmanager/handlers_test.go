@@ -529,3 +529,38 @@ func TestHandleDeleteSandbox_DetachedContext(t *testing.T) {
 	require.True(t, storeDeleteCalled, "DeleteSandboxBySessionID should be called even if the request context is canceled")
 	require.Equal(t, http.StatusOK, w.Code)
 }
+
+// TestInjectSnapshotRestoreIntent_SkipsWhenSandboxClaim verifies that the restore
+// annotation is not set when a SandboxClaim is used (warm-pool path). Warm-pool
+// placement is handled by the claim controller; no snapshot annotation is needed.
+func TestInjectSnapshotRestoreIntent_SkipsWhenSandboxClaim(t *testing.T) {
+	s := &Server{}
+	sandbox := &sandboxv1alpha1.Sandbox{}
+	claim := &extensionsv1alpha1.SandboxClaim{}
+	req := &types.CreateSandboxRequest{Namespace: "ns", Name: "ci"}
+
+	s.injectSnapshotRestoreIntent(context.Background(), req, sandbox, claim)
+
+	if annotations := sandbox.Spec.PodTemplate.ObjectMeta.Annotations; annotations != nil {
+		if _, ok := annotations[runtimev1alpha1.SnapshotKeyAnnotation]; ok {
+			t.Error("snapshot-key annotation must not be set when SandboxClaim is used")
+		}
+	}
+}
+
+// TestInjectSnapshotRestoreIntent_SkipsWhenNoSnapshotClient verifies that the function
+// is a no-op when SnapStart is not configured (snapshotClient == nil). Sessions fall
+// back to cold-start without any snapshot annotation on the Sandbox.
+func TestInjectSnapshotRestoreIntent_SkipsWhenNoSnapshotClient(t *testing.T) {
+	s := &Server{snapshotClient: nil, artifactStore: nil}
+	sandbox := &sandboxv1alpha1.Sandbox{}
+	req := &types.CreateSandboxRequest{Namespace: "ns", Name: "ci"}
+
+	s.injectSnapshotRestoreIntent(context.Background(), req, sandbox, nil)
+
+	if annotations := sandbox.Spec.PodTemplate.ObjectMeta.Annotations; annotations != nil {
+		if _, ok := annotations[runtimev1alpha1.SnapshotKeyAnnotation]; ok {
+			t.Error("snapshot-key annotation must not be set when snapshotClient is nil")
+		}
+	}
+}

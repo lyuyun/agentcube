@@ -58,11 +58,53 @@ func main() {
 		close(errCh)
 	}()
 
+	if server.SessionGateEnabled() {
+		// Wait until the HTTP listener is bound (bootstrap complete) before
+		// opening the inject socket. The Kuasar sandboxer requires the workload
+		// to be in a quiescent state at this point.
+		select {
+		case <-ctx.Done():
+			klog.Info("Received shutdown signal before bootstrap complete")
+			<-errCh
+			return
+		case <-server.ListenerReady():
+		case err := <-errCh:
+			klog.Fatalf("Server error before bootstrap complete: %v", err)
+		}
+
+		// Open the inject socket and run the WarmFork handshake.
+		//
+		// Initial snapshot path: blocks indefinitely at Accept(); the VM is captured
+		// while picod waits here. sessionGate=true is baked into the snapshot memory.
+		//
+		// Restore path: the process resumes from Accept() in the restored VM, completes
+		// the handshake with Kuasar, and reaches the code below. This is the mechanism
+		// for "after restore, inject fresh session state" (design §7.4):
+		//   - Autonomous mode (Phase 1): Kuasar sends COMMIT directly; EnvOverrides is
+		//     empty, so no session-specific env vars are applied.
+		//   - Injection mode (Phase 2): Kuasar sends PREPARE with per-session env vars
+		//     before COMMIT; those overrides are applied below via os.Setenv.
+		result, err := picod.WaitForHandshake(ctx, "")
+		if err != nil {
+			klog.Fatalf("WarmFork handshake error: %v", err)
+		}
+
+		// Apply per-session env overrides from PREPARE. Empty in Phase 1 autonomous mode.
+		for k, v := range result.EnvOverrides {
+			if err := os.Setenv(k, v); err != nil {
+				klog.Warningf("Failed to apply env override %s: %v", k, err)
+			}
+		}
+
+		// Open the session gate: user requests can now be served.
+		server.OpenSessionGate()
+		klog.V(2).InfoS("picod: session gate open, HTTP API ready", "taskID", result.TaskID)
+	}
+
 	// Wait for signal or fatal error
 	select {
 	case <-ctx.Done():
 		klog.Info("Received shutdown signal, shutting down gracefully...")
-		cancel()
 		<-errCh
 	case err := <-errCh:
 		klog.Fatalf("Server error: %v", err)

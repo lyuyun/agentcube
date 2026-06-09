@@ -182,6 +182,25 @@ func (s *Server) buildSandboxForRequest(ctx context.Context, sandboxReq *types.C
 	}
 }
 
+// injectSnapshotRestoreIntent annotates the session Sandbox with the active Fork
+// snapshot key so Kuasar restores the VM instead of cold-starting it.
+//
+// After restore, Kuasar runs the WarmFork handshake with the resumed picod process.
+// This is the "session path injects fresh session state" mechanism (design §7.4):
+//   - Phase 1 (autonomous mode): Kuasar sends COMMIT with no PREPARE; EnvOverrides is
+//     empty. Session identity comes per-request via JWT; workspace isolation is provided
+//     by Kuasar's CoW filesystem copy of the build Sandbox, which never served a user
+//     request because the build-mode HTTP gate blocked all /api/* traffic at snapshot time.
+//   - Phase 2 (injection mode): Kuasar sends PREPARE carrying per-session env vars before
+//     COMMIT; picod applies them via os.Setenv in cmd/picod/main.go before calling Ungate().
+//
+// AGENTCUBE_SESSION_GATE is absent from the session Sandbox PodSpec so that
+// cold-start sessions (no active snapshot) start immediately without the WarmFork
+// handshake. Restore sessions get sessionGate=true from the snapshot's process memory
+// and therefore do run the handshake.
+//
+// When a SandboxClaim is used (warm-pool path) the claim mechanism handles placement
+// directly; no snapshot annotation is needed.
 func (s *Server) injectSnapshotRestoreIntent(ctx context.Context, sandboxReq *types.CreateSandboxRequest, sandbox *sandboxv1alpha1.Sandbox, sandboxClaim *extensionsv1alpha1.SandboxClaim) {
 	if sandboxClaim != nil || s.snapshotClient == nil || s.artifactStore == nil {
 		return

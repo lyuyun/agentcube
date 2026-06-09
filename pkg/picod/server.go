@@ -19,8 +19,10 @@ package picod
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gin-contrib/gzip"
@@ -46,14 +48,30 @@ type Server struct {
 	authManager  *AuthManager
 	startTime    time.Time
 	workspaceDir string
+
+	// sessionGate is true when AGENTCUBE_SESSION_GATE=true.
+	// In this mode the /api/* routes are gated until Ungate() is called.
+	sessionGate  bool
+	sessionReady chan struct{}
+	ungateOnce   sync.Once
+
+	// readyCh is closed once the HTTP listener is bound and ready to accept.
+	readyCh chan struct{}
 }
 
 // NewServer creates a new PicoD server instance
 func NewServer(config Config) *Server {
+	sessionGate := os.Getenv("AGENTCUBE_SESSION_GATE") == "true"
 	s := &Server{
 		config:      config,
 		startTime:   time.Now(),
 		authManager: NewAuthManager(),
+		sessionGate: sessionGate,
+		readyCh:     make(chan struct{}),
+	}
+	if sessionGate {
+		s.sessionReady = make(chan struct{})
+		klog.V(2).InfoS("picod: session gate enabled, HTTP API gated until session injection")
 	}
 
 	// Initialize workspace directory
@@ -88,8 +106,12 @@ func NewServer(config Config) *Server {
 		klog.Fatalf("Failed to load public key from environment: %v", err)
 	}
 
-	// API route group with JWT authentication
+	// API route group with JWT authentication.
+	// In build mode a gate middleware blocks requests until Ungate() is called.
 	api := engine.Group("/api")
+	if s.sessionGate {
+		api.Use(s.gateMiddleware())
+	}
 	api.Use(s.authManager.AuthMiddleware())
 	{
 		api.POST("/execute", s.ExecuteHandler)
@@ -125,8 +147,16 @@ func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf(":%d", s.config.Port)
 	klog.Infof("PicoD server starting on %s", addr)
 
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+
+	// Signal that the listener is bound and the server is ready to accept
+	// connections. WaitForHandshake may be called after this point.
+	close(s.readyCh)
+
 	httpServer := &http.Server{
-		Addr:              addr,
 		Handler:           s.engine,
 		ReadHeaderTimeout: 10 * time.Second, // Prevent Slowloris attacks
 	}
@@ -142,10 +172,49 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
+}
+
+// SessionGateEnabled reports whether the server has a session gate installed.
+// When true, /api/* requests are blocked until OpenSessionGate() is called.
+func (s *Server) SessionGateEnabled() bool {
+	return s.sessionGate
+}
+
+// ListenerReady returns a channel that is closed once the HTTP listener is bound.
+func (s *Server) ListenerReady() <-chan struct{} {
+	return s.readyCh
+}
+
+// OpenSessionGate releases the session gate and allows user requests through the
+// HTTP API. It is idempotent and safe to call from any goroutine.
+// In non-gate mode it is a no-op.
+func (s *Server) OpenSessionGate() {
+	if !s.sessionGate {
+		return
+	}
+	s.ungateOnce.Do(func() {
+		close(s.sessionReady)
+		klog.V(2).InfoS("picod: session gate open, HTTP API ready")
+	})
+}
+
+// gateMiddleware returns a Gin middleware that blocks /api/* requests until
+// OpenSessionGate() is called. It returns 503 immediately while the gate is closed.
+func (s *Server) gateMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		select {
+		case <-s.sessionReady:
+			c.Next()
+		default:
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"error": "sandbox not ready: awaiting session injection",
+			})
+		}
+	}
 }
 
 // HealthCheckHandler handles health check requests

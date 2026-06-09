@@ -305,6 +305,46 @@ func buildCodeInterpreterEnvVars(templateEnv []corev1.EnvVar, authMode runtimev1
 	return envVars
 }
 
+// codeInterpreterContainerName is the canonical container name for all
+// CodeInterpreter sandbox pods, used in both the SandboxTemplate and the
+// session Sandbox so that SnapStart snapshot sources and restore targets agree.
+const codeInterpreterContainerName = "code-interpreter"
+
+// buildCodeInterpreterPodTemplate is the single source of truth for the
+// CodeInterpreter pod template. Both the SandboxTemplate (SnapStart source)
+// and the session Sandbox use this function so that container name,
+// environment variables, and pod metadata are identical on both paths.
+func buildCodeInterpreterPodTemplate(template *runtimev1alpha1.CodeInterpreterSandboxTemplate, authMode runtimev1alpha1.AuthModeType) sandboxv1alpha1.PodTemplate {
+	runtimeClassName := template.RuntimeClassName
+	if runtimeClassName != nil && *runtimeClassName == "" {
+		runtimeClassName = nil
+	}
+
+	podSpec := corev1.PodSpec{
+		ImagePullSecrets: template.ImagePullSecrets,
+		RuntimeClassName: runtimeClassName,
+		Containers: []corev1.Container{
+			{
+				Name:            codeInterpreterContainerName,
+				Image:           template.Image,
+				ImagePullPolicy: template.ImagePullPolicy,
+				Command:         template.Command,
+				Args:            template.Args,
+				Env:             buildCodeInterpreterEnvVars(template.Environment, authMode),
+				Resources:       template.Resources,
+			},
+		},
+	}
+
+	return sandboxv1alpha1.PodTemplate{
+		Spec: podSpec,
+		ObjectMeta: sandboxv1alpha1.PodMetadata{
+			Labels:      template.Labels,
+			Annotations: template.Annotations,
+		},
+	}
+}
+
 func buildSandboxByCodeInterpreter(namespace string, codeInterpreterName string, informer *Informers) (*sandboxv1alpha1.Sandbox, *extensionsv1alpha1.SandboxClaim, *sandboxEntry, error) {
 	codeInterpreterObj, err := informer.CodeInterpreterLister.CodeInterpreters(namespace).Get(codeInterpreterName)
 	if err != nil {
@@ -376,38 +416,16 @@ func buildSandboxByCodeInterpreter(namespace string, codeInterpreterName string,
 		return simpleSandbox, sandboxClaim, sandboxEntry, nil
 	}
 
-	// Normalize RuntimeClassName: if it's an empty string, set it to nil
-	runtimeClassName := codeInterpreterObj.Spec.Template.RuntimeClassName
-	if runtimeClassName != nil && *runtimeClassName == "" {
-		runtimeClassName = nil
-	}
-
-	envVars := buildCodeInterpreterEnvVars(codeInterpreterObj.Spec.Template.Environment, codeInterpreterObj.Spec.AuthMode)
-
-	podSpec := corev1.PodSpec{
-		ImagePullSecrets: codeInterpreterObj.Spec.Template.ImagePullSecrets,
-		RuntimeClassName: runtimeClassName,
-		Containers: []corev1.Container{
-			{
-				Name:            "code-interpreter",
-				Image:           codeInterpreterObj.Spec.Template.Image,
-				ImagePullPolicy: codeInterpreterObj.Spec.Template.ImagePullPolicy,
-				Env:             envVars,
-				Command:         codeInterpreterObj.Spec.Template.Command,
-				Args:            codeInterpreterObj.Spec.Template.Args,
-				Resources:       codeInterpreterObj.Spec.Template.Resources,
-			},
-		},
-	}
+	podTemplate := buildCodeInterpreterPodTemplate(codeInterpreterObj.Spec.Template, codeInterpreterObj.Spec.AuthMode)
 
 	buildParams := &buildSandboxParams{
 		sandboxName:    sandboxName,
 		namespace:      namespace,
 		workloadName:   codeInterpreterName,
 		sessionID:      sessionID,
-		podSpec:        podSpec,
-		podLabels:      codeInterpreterObj.Spec.Template.Labels,
-		podAnnotations: codeInterpreterObj.Spec.Template.Annotations,
+		podSpec:        podTemplate.Spec,
+		podLabels:      podTemplate.ObjectMeta.Labels,
+		podAnnotations: podTemplate.ObjectMeta.Annotations,
 		idleTimeout:    idleTimeout,
 	}
 

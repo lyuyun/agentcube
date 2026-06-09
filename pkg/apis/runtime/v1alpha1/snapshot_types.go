@@ -49,6 +49,13 @@ type SnapshotClassSpec struct {
 	// NodeSelector selects which nodes are eligible for snapshot builds.
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// BuildPodAnnotations are annotations applied verbatim to the build
+	// Sandbox's pod template when creating a snapshot. Use this field for
+	// provider-specific pod annotations (e.g. kuasar.io/* for WarmFork
+	// readiness) so that the generic workload manager remains provider-agnostic.
+	// +optional
+	BuildPodAnnotations map[string]string `json:"buildPodAnnotations,omitempty"`
 }
 
 // SnapshotClassList contains a list of SnapshotClass.
