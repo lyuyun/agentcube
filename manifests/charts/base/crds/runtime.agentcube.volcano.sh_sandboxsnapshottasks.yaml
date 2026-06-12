@@ -69,6 +69,7 @@ spec:
                 description: SnapshotMode is the mode of this snapshot task.
                 enum:
                 - Fork
+                - Resume
                 type: string
               snapshotRef:
                 description: SnapshotRef is the owning SandboxSnapshot for this task.

@@ -45,11 +45,11 @@ spec:
               buildPodAnnotations:
                 additionalProperties:
                   type: string
-                description: BuildPodAnnotations are annotations applied verbatim
-                  to the build Sandbox's pod template when creating a snapshot. Use
-                  this field for provider-specific pod annotations (e.g. kuasar.io/*
-                  for WarmFork readiness) so that the generic workload manager remains
-                  provider-agnostic.
+                description: |-
+                  BuildPodAnnotations are annotations applied verbatim to the build
+                  Sandbox's pod template when creating a snapshot. Use this field for
+                  provider-specific pod annotations (e.g. kuasar.io/* for WarmFork
+                  readiness) so that the generic workload manager remains provider-agnostic.
                 type: object
               nodeSelector:
                 additionalProperties:
@@ -66,9 +66,15 @@ spec:
                 description: SupportedSnapshotModes lists the snapshot modes this
                   class supports.
                 items:
-                  description: SandboxSnapshotMode selects the snapshot usage mode.
+                  description: |-
+                    SandboxSnapshotMode selects the snapshot usage mode.
+
+                    Phase 1 implements Fork only. Resume is accepted by the API but the controller
+                    returns "unsupported snapshotMode" until Phase 2. An admission webhook validating
+                    SnapshotClass.supportedSnapshotModes compatibility is planned but not yet implemented.
                   enum:
                   - Fork
+                  - Resume
                   type: string
                 minItems: 1
                 type: array

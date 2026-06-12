@@ -58,14 +58,25 @@ func (d *Driver) createSnapshotFork(ctx context.Context, req agentdriver.Snapsho
 		"snapshotKey", req.SnapshotKey,
 		"sandbox", req.TargetSandboxRef.Name)
 
+	sandboxID, err := d.resolveSandboxID(ctx, req.TaskRef.Namespace, req.TargetSandboxRef.Name)
+	if err != nil {
+		return nil, fmt.Errorf("kuasar driver: resolve sandbox ID for pod %s/%s: %w",
+			req.TaskRef.Namespace, req.TargetSandboxRef.Name, err)
+	}
+
+	klog.V(2).InfoS("kuasar driver: resolved Kuasar sandbox ID",
+		"sandbox", req.TargetSandboxRef.Name,
+		"kuasarSandboxID", sandboxID)
+
 	var resp snapshotForkCreateResponse
 	if err := d.adminRPC(ctx, snapshotTimeout, snapshotForkCreateRequest{
 		Action:       "template-create",
-		SandboxID:    req.TargetSandboxRef.Name,
+		SandboxID:    sandboxID,
 		Key:          req.SnapshotKey,
 		SnapshotType: "warm_fork",
 	}, &resp); err != nil {
-		return nil, fmt.Errorf("kuasar driver: template-create for sandbox %s: %w", req.TargetSandboxRef.Name, err)
+		return nil, fmt.Errorf("kuasar driver: template-create for sandbox %s (kuasarID=%s): %w",
+			req.TargetSandboxRef.Name, sandboxID, err)
 	}
 
 	klog.V(2).InfoS("kuasar driver: Fork snapshot created",

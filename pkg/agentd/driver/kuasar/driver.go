@@ -36,6 +36,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -221,6 +223,91 @@ func (d *Driver) findKuasarArtifact(ctx context.Context, snapshotKey string) (*k
 		}
 	}
 	return nil, nil
+}
+
+// --- sandbox-list (used for sandbox ID resolution) ---
+
+type sandboxListRequest struct {
+	Action string `json:"action"`
+}
+
+type sandboxListEntry struct {
+	ID      string `json:"id"`
+	Status  string `json:"status"`
+	BaseDir string `json:"base_dir"`
+}
+
+type sandboxListResponse struct {
+	Sandboxes []sandboxListEntry `json:"sandboxes"`
+}
+
+// sandboxJSONMeta is the minimal subset of sandbox.json needed to match a sandbox
+// to its Kubernetes pod. Kuasar serialises the full KuasarSandbox struct to this file;
+// we only decode the two fields required for the lookup.
+type sandboxJSONMeta struct {
+	Data struct {
+		Config *struct {
+			Metadata struct {
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"metadata"`
+		} `json:"config"`
+	} `json:"data"`
+}
+
+// resolveSandboxID returns the Kuasar-internal sandbox ID (containerd CRI sandbox ID)
+// for the pod identified by podNamespace/podName.
+//
+// Kuasar tracks each VM sandbox under a directory named after the containerd-assigned
+// sandbox ID. The sandbox.json file in that directory contains the CRI PodSandboxConfig
+// (including pod name and namespace) serialised by serde. We call sandbox-list to get
+// the running sandboxes, then scan sandbox.json files to find the match.
+//
+// Only sandboxes with status "running" are considered: Kuasar rejects template-create
+// for non-running sandboxes, and sandbox.json files from stopped/deleted sandboxes may
+// linger on disk, causing false matches. If more than one running sandbox matches the
+// same pod name and namespace an error is returned; this should not happen in practice
+// since Kubernetes pod names are unique within a namespace.
+func (d *Driver) resolveSandboxID(ctx context.Context, podNamespace, podName string) (string, error) {
+	var resp sandboxListResponse
+	if err := d.adminRPC(ctx, adminTimeout, sandboxListRequest{Action: "sandbox-list"}, &resp); err != nil {
+		return "", fmt.Errorf("sandbox-list: %w", err)
+	}
+
+	var matches []string
+	for _, sb := range resp.Sandboxes {
+		if sb.BaseDir == "" || sb.ID == "" || sb.Status != "running" {
+			continue
+		}
+		jsonPath := filepath.Join(sb.BaseDir, "sandbox.json")
+		raw, err := os.ReadFile(jsonPath)
+		if err != nil {
+			klog.V(4).InfoS("kuasar driver: skip sandbox.json", "path", jsonPath, "err", err)
+			continue
+		}
+		var meta sandboxJSONMeta
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			klog.V(4).InfoS("kuasar driver: parse sandbox.json failed", "path", jsonPath, "err", err)
+			continue
+		}
+		if meta.Data.Config == nil {
+			continue
+		}
+		m := meta.Data.Config.Metadata
+		if m.Namespace == podNamespace && m.Name == podName {
+			matches = append(matches, sb.ID)
+		}
+	}
+
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return "", fmt.Errorf("no running kuasar sandbox found for pod %s/%s", podNamespace, podName)
+	default:
+		return "", fmt.Errorf("ambiguous: %d running kuasar sandboxes match pod %s/%s: %v",
+			len(matches), podNamespace, podName, matches)
+	}
 }
 
 func init() {
