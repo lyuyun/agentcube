@@ -72,7 +72,17 @@ agentd:
     requests:
       cpu: 50m
       memory: 64Mi
+  # nodeSelector targets nodes where the runtime driver is installed.
+  nodeSelector: {}
   extraEnv: []
+  extraVolumes:
+    - name: kuasar-admin-socket
+      hostPath:
+        path: /run/vmm-sandboxer-admin.sock
+        type: Socket
+  extraVolumeMounts:
+    - name: kuasar-admin-socket
+      mountPath: /run/vmm-sandboxer-admin.sock
 
 # Volcano Agent Scheduler
 volcano:

@@ -152,6 +152,7 @@ install: build
 # Docker image variables
 WORKLOAD_MANAGER_IMAGE ?= workloadmanager:latest
 ROUTER_IMAGE ?= agentcube-router:latest
+AGENTD_IMAGE ?= agentd:latest
 PICOD_IMAGE ?= picod:latest
 IMAGE_REGISTRY ?= ""
 
@@ -224,6 +225,36 @@ docker-push-router: docker-build-router
 kind-load-router:
 	@echo "Loading router image to kind..."
 	kind load docker-image $(ROUTER_IMAGE)
+
+# Agentd Docker targets
+docker-build-agentd:
+	@echo "Building Agentd Docker image..."
+	docker build -f docker/Dockerfile.agentd -t $(AGENTD_IMAGE) .
+
+# Multi-architecture build for agentd (supports amd64, arm64)
+docker-buildx-agentd:
+	@echo "Building multi-architecture Agentd Docker image..."
+	docker buildx build -f docker/Dockerfile.agentd --platform linux/amd64,linux/arm64 -t $(AGENTD_IMAGE) .
+
+# Multi-architecture build and push for agentd
+docker-buildx-push-agentd:
+	@if [ -z "$(IMAGE_REGISTRY)" ]; then \
+		echo "Error: IMAGE_REGISTRY not set. Usage: make docker-buildx-push-agentd IMAGE_REGISTRY=your-registry.com"; \
+		exit 1; \
+	fi
+	@echo "Building and pushing multi-architecture Agentd Docker image to $(IMAGE_REGISTRY)/$(AGENTD_IMAGE)..."
+	docker buildx build -f docker/Dockerfile.agentd --platform linux/amd64,linux/arm64 \
+		-t $(IMAGE_REGISTRY)/$(AGENTD_IMAGE) \
+		--push .
+
+docker-push-agentd: docker-build-agentd
+	@if [ -z "$(IMAGE_REGISTRY)" ]; then \
+		echo "Error: IMAGE_REGISTRY not set. Usage: make docker-push-agentd IMAGE_REGISTRY=your-registry.com"; \
+		exit 1; \
+	fi
+	@echo "Tagging and pushing Agentd Docker image to $(IMAGE_REGISTRY)/$(AGENTD_IMAGE)..."
+	docker tag $(AGENTD_IMAGE) $(IMAGE_REGISTRY)/$(AGENTD_IMAGE)
+	docker push $(IMAGE_REGISTRY)/$(AGENTD_IMAGE)
 
 # Picod Docker targets
 docker-build-picod:

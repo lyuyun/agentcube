@@ -30,7 +30,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"github.com/volcano-sh/agentcube/pkg/agentd"
 	agentdriver "github.com/volcano-sh/agentcube/pkg/agentd/driver"
 	// Register all built-in snapshot drivers via their init() functions.
 	_ "github.com/volcano-sh/agentcube/pkg/agentd/driver/all"
@@ -75,16 +74,6 @@ func main() {
 	registry, err := agentdriver.BuildDefaultRegistry()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to build driver registry: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err = ctrl.NewControllerManagedBy(mgr).
-		For(&sandboxv1alpha1.Sandbox{}).
-		Complete(&agentd.Reconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
-		}); err != nil {
-		fmt.Fprintf(os.Stderr, "unable to create sandbox controller: %v\n", err)
 		os.Exit(1)
 	}
 

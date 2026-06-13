@@ -1,0 +1,38 @@
+# Multi-stage build for agentd
+FROM golang:1.24.9-alpine AS builder
+
+# Build arguments for multi-architecture support
+ARG TARGETOS=linux
+ARG TARGETARCH
+
+WORKDIR /workspace
+
+# Copy go mod files
+COPY go.mod go.sum ./
+
+# Download dependencies with caching
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+# Copy source code
+COPY cmd/ cmd/
+COPY pkg/ pkg/
+COPY client-go/ client-go/
+
+# Build with dynamic architecture support and caching
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -ldflags="-s -w" -o agentd ./cmd/agentd
+
+# Runtime image
+FROM alpine:3.19
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /workspace/agentd .
+
+ENTRYPOINT ["/app/agentd"]
