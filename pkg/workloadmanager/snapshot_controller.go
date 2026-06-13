@@ -80,17 +80,20 @@ func (r *SandboxSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	sc := &runtimev1alpha1.SnapshotClass{}
 	if err := r.Get(ctx, types.NamespacedName{Name: ss.Spec.SnapshotClassName}, sc); err != nil {
 		if apierrors.IsNotFound(err) {
-			return r.setFailed(ctx, ss, "SnapshotClass not found: "+ss.Spec.SnapshotClassName)
+			r.Recorder.Event(ss, corev1.EventTypeWarning, "SnapshotClassNotFound", "SnapshotClass not found: "+ss.Spec.SnapshotClassName)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
 	handler, ok := r.Handlers[ss.Spec.SnapshotMode]
 	if !ok {
-		return r.setFailed(ctx, ss, "unsupported snapshotMode: "+string(ss.Spec.SnapshotMode))
+		r.Recorder.Event(ss, corev1.EventTypeWarning, "UnsupportedSnapshotMode", "unsupported snapshotMode: "+string(ss.Spec.SnapshotMode))
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	if !containsMode(sc.Spec.SupportedSnapshotModes, ss.Spec.SnapshotMode) {
-		return r.setFailed(ctx, ss, fmt.Sprintf("SnapshotClass %q does not support mode %q", sc.Name, ss.Spec.SnapshotMode))
+		r.Recorder.Event(ss, corev1.EventTypeWarning, "SnapshotModeNotSupported", fmt.Sprintf("SnapshotClass %q does not support mode %q", sc.Name, ss.Spec.SnapshotMode))
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	return r.reconcileWithHandler(ctx, ss, sc, handler)
@@ -124,6 +127,7 @@ func (r *SandboxSnapshotReconciler) reconcileWithHandler(ctx context.Context, ss
 		pending, ok := manifest.ArtifactSets[manifest.PendingSetRef.SnapshotKey]
 		if ok && handler.ReadyToPromote(pending) {
 			logger.Info("promoting pending artifact set to active", "snapshot", ss.Name, "snapshotKey", pending.SnapshotKey)
+			r.Recorder.Event(ss, corev1.EventTypeNormal, "SandboxSnapshotPromoted", "background rebuild completed; switching to new artifact set")
 			if manifest.ActiveSetRef.SnapshotKey != "" {
 				delete(manifest.ArtifactSets, manifest.ActiveSetRef.SnapshotKey)
 			}
@@ -208,9 +212,7 @@ func (r *SandboxSnapshotReconciler) cleanupCompletedTasks(ctx context.Context, s
 	for i := range taskList.Items {
 		task := &taskList.Items[i]
 		phase := task.Status.Phase
-		if phase != runtimev1alpha1.SnapshotArtifactPhaseReady &&
-			phase != runtimev1alpha1.SnapshotArtifactPhaseFailed &&
-			phase != runtimev1alpha1.SnapshotArtifactPhaseUnavailable {
+		if phase != runtimev1alpha1.SnapshotArtifactPhaseReady {
 			continue
 		}
 		if err := handler.CleanupTask(ctx, ss, task); err != nil {
@@ -275,50 +277,26 @@ func (r *SandboxSnapshotReconciler) syncArtifactStatus(ctx context.Context, mani
 
 func updateArtifactFromTask(art *store.SnapshotArtifact, task *runtimev1alpha1.SandboxSnapshotTask) bool {
 	newPhase := store.SnapshotArtifactPhase(task.Status.Phase)
-	if newPhase == "" || newPhase == art.Phase {
+	phaseChanged := newPhase != "" && newPhase != art.Phase
+	messageChanged := task.Status.Message != art.Message
+	if !phaseChanged && !messageChanged {
 		return false
 	}
-	art.Phase = newPhase
-	art.Message = task.Status.Message
-	switch newPhase {
-	case store.SnapshotArtifactPhaseReady:
-		now := time.Now()
-		if art.CreatedAt == nil {
-			art.CreatedAt = &now
+	if phaseChanged {
+		art.Phase = newPhase
+		if newPhase == store.SnapshotArtifactPhaseReady {
+			now := time.Now()
+			if art.CreatedAt == nil {
+				art.CreatedAt = &now
+			}
+			recordBuildDuration(art.ProviderName, string(task.Spec.SnapshotMode), task.CreationTimestamp.Time)
 		}
-		recordBuildDuration(art.ProviderName, string(task.Spec.SnapshotMode), task.CreationTimestamp.Time)
-	case store.SnapshotArtifactPhaseFailed:
-		incrementBuildRetry(art)
+		recordArtifactPhaseTransition(art.ProviderName, newPhase)
 	}
-	recordArtifactPhaseTransition(art.ProviderName, newPhase)
+	art.Message = task.Status.Message
 	return true
 }
 
-// retryBackoffSteps defines the per-attempt wait durations before a failed artifact is retried.
-var retryBackoffSteps = []time.Duration{
-	1 * time.Minute,
-	2 * time.Minute,
-	4 * time.Minute,
-	8 * time.Minute,
-	16 * time.Minute,
-	30 * time.Minute,
-}
-
-// incrementBuildRetry advances the retry counter and computes the next eligible retry time.
-func incrementBuildRetry(art *store.SnapshotArtifact) {
-	if art.Retry == nil {
-		art.Retry = &store.SnapshotBuildRetry{}
-	}
-	art.Retry.FailureCount++
-	now := time.Now()
-	art.Retry.LastFailedAt = &now
-	idx := int(art.Retry.FailureCount) - 1
-	if idx >= len(retryBackoffSteps) {
-		idx = len(retryBackoffSteps) - 1
-	}
-	next := now.Add(retryBackoffSteps[idx])
-	art.Retry.NextRetryAt = &next
-}
 
 func (r *SandboxSnapshotReconciler) aggregateAndUpdateStatus(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, manifest *store.SnapshotArtifactManifest) (ctrl.Result, error) {
 	activeSet := activeArtifactSet(manifest)
@@ -328,7 +306,22 @@ func (r *SandboxSnapshotReconciler) aggregateAndUpdateStatus(ctx context.Context
 	if status.Phase == runtimev1alpha1.SandboxSnapshotPhaseReady && ss.Status.Phase != runtimev1alpha1.SandboxSnapshotPhaseReady {
 		r.Recorder.Event(ss, corev1.EventTypeNormal, "SandboxSnapshotReady", "at least one artifact is available")
 	}
-	if status.Phase == runtimev1alpha1.SandboxSnapshotPhaseCreating {
+	if status.Phase == runtimev1alpha1.SandboxSnapshotPhaseReady &&
+		(status.FailedNodeCount > 0 || status.UnavailableNodeCount > 0) &&
+		(ss.Status.FailedNodeCount != status.FailedNodeCount || ss.Status.UnavailableNodeCount != status.UnavailableNodeCount) {
+		r.Recorder.Event(ss, corev1.EventTypeWarning, "SandboxSnapshotDegraded",
+			fmt.Sprintf("%d/%d nodes have failed or unavailable artifacts", status.FailedNodeCount+status.UnavailableNodeCount, status.TargetNodeCount))
+	}
+	if status.FailedNodeCount == status.TargetNodeCount && status.TargetNodeCount > 0 &&
+		ss.Status.FailedNodeCount != status.FailedNodeCount {
+		r.Recorder.Event(ss, corev1.EventTypeWarning, "AllArtifactsFailed", "all artifact builds failed")
+	}
+	if status.Phase == runtimev1alpha1.SandboxSnapshotPhaseCreating &&
+		status.Message != "" && status.Message != ss.Status.Message {
+		r.Recorder.Event(ss, corev1.EventTypeWarning, "ArtifactBuildError", status.Message)
+	}
+
+	if status.Phase != runtimev1alpha1.SandboxSnapshotPhaseReady {
 		return r.patchSnapshotStatus(ctx, ss, status, ctrl.Result{RequeueAfter: 15 * time.Second})
 	}
 	return r.patchSnapshotStatus(ctx, ss, status, ctrl.Result{})
@@ -359,17 +352,24 @@ func (r *SandboxSnapshotReconciler) buildSnapshotStatus(ss *runtimev1alpha1.Sand
 		} else {
 			status.ReadyAt = ss.Status.ReadyAt
 		}
-		if status.FailedNodeCount > 0 || status.UnavailableNodeCount > 0 {
-			r.Recorder.Event(ss, corev1.EventTypeWarning, "SandboxSnapshotDegraded",
-				fmt.Sprintf("%d/%d nodes have failed or unavailable artifacts", status.FailedNodeCount+status.UnavailableNodeCount, total))
-		}
 	case status.FailedNodeCount == total && total > 0:
-		status.Phase = runtimev1alpha1.SandboxSnapshotPhaseFailed
-		r.Recorder.Event(ss, corev1.EventTypeWarning, "SandboxSnapshotFailed", "all artifact builds failed")
+		status.Phase = runtimev1alpha1.SandboxSnapshotPhaseCreating
+		status.Message = aggregateArtifactMessages(workingArtifacts)
 	default:
 		status.Phase = runtimev1alpha1.SandboxSnapshotPhaseCreating
+		status.Message = aggregateArtifactMessages(workingArtifacts)
 	}
 	return status
+}
+
+func aggregateArtifactMessages(artifacts []store.SnapshotArtifact) string {
+	var parts []string
+	for _, art := range artifacts {
+		if art.Message != "" {
+			parts = append(parts, art.NodeName+": "+art.Message)
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (r *SandboxSnapshotReconciler) patchSnapshotStatus(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, status runtimev1alpha1.SandboxSnapshotStatus, result ctrl.Result) (ctrl.Result, error) {
@@ -384,15 +384,6 @@ func (r *SandboxSnapshotReconciler) patchSnapshotStatus(ctx context.Context, ss 
 	return result, nil
 }
 
-func (r *SandboxSnapshotReconciler) setFailed(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, msg string) (ctrl.Result, error) {
-	patch := client.MergeFrom(ss.DeepCopy())
-	ss.Status.Phase = runtimev1alpha1.SandboxSnapshotPhaseFailed
-	ss.Status.Message = msg
-	if err := r.Status().Patch(ctx, ss, patch); err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{}, nil
-}
 
 // -- Shared manifest helpers --
 
@@ -424,6 +415,7 @@ func saveManifest(ctx context.Context, as store.ArtifactStore, ownerKey string, 
 	}
 	return string(raw), nil
 }
+
 
 func startNewArtifactSet(ss *runtimev1alpha1.SandboxSnapshot, manifest *store.SnapshotArtifactManifest, snapshotHash string) string {
 	manifest.RebuildSeq++
@@ -596,6 +588,26 @@ func (r *SandboxSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return reqs
 	})
 
+	// snapshotClassToSnapshotMapper re-enqueues all SandboxSnapshots that reference a changed SnapshotClass.
+	// SnapshotClass is cluster-scoped, so the mapper scans all snapshots and filters in-memory.
+	snapshotClassToSnapshotMapper := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+		return snapshotClassToSnapshotRequests(ctx, r.Client, obj.GetName())
+	})
+
+	snapshotClassPredicate := predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool { return true },
+		DeleteFunc: func(event.DeleteEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldObj, ok1 := e.ObjectOld.(*runtimev1alpha1.SnapshotClass)
+			newObj, ok2 := e.ObjectNew.(*runtimev1alpha1.SnapshotClass)
+			if !ok1 || !ok2 {
+				return false
+			}
+			return oldObj.Generation != newObj.Generation
+		},
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+
 	// nodeToSnapshotMapper re-enqueues all SandboxSnapshots on any node change.
 	// Listing all snapshots ensures that a newly-joined node (which has no tasks yet)
 	// also triggers artifact builds for existing snapshots.
@@ -636,6 +648,8 @@ func (r *SandboxSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&runtimev1alpha1.SandboxSnapshot{}).
 		Owns(&runtimev1alpha1.SandboxSnapshotTask{}).
 		Owns(&sandboxv1alpha1.Sandbox{}).
+		Watches(&runtimev1alpha1.SnapshotClass{}, snapshotClassToSnapshotMapper,
+			builder.WithPredicates(snapshotClassPredicate)).
 		Watches(&extensionsv1alpha1.SandboxTemplate{}, templateToSnapshotMapper,
 			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Watches(&corev1.Node{}, nodeToSnapshotMapper,
@@ -659,4 +673,22 @@ func nodeReadyStatusChanged(old, new *corev1.Node) bool {
 	oldReady := nodeIsReady(old)
 	newReady := nodeIsReady(new)
 	return oldReady != newReady
+}
+
+func snapshotClassToSnapshotRequests(ctx context.Context, c client.Client, className string) []ctrl.Request {
+	snapshotList := &runtimev1alpha1.SandboxSnapshotList{}
+	if err := c.List(ctx, snapshotList); err != nil {
+		return nil
+	}
+	reqs := make([]ctrl.Request, 0, len(snapshotList.Items))
+	for _, ss := range snapshotList.Items {
+		if ss.Spec.SnapshotClassName != className {
+			continue
+		}
+		reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
+			Namespace: ss.Namespace,
+			Name:      ss.Name,
+		}})
+	}
+	return reqs
 }

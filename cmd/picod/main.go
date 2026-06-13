@@ -60,7 +60,7 @@ func main() {
 
 	if server.SessionGateEnabled() {
 		// Wait until the HTTP listener is bound (bootstrap complete) before
-		// opening the inject socket. The Kuasar sandboxer requires the workload
+		// opening the inject socket. The sandbox runtime requires the workload
 		// to be in a quiescent state at this point.
 		select {
 		case <-ctx.Done():
@@ -78,11 +78,11 @@ func main() {
 		// while picod waits here. sessionGate=true is baked into the snapshot memory.
 		//
 		// Restore path: the process resumes from Accept() in the restored VM, completes
-		// the handshake with Kuasar, and reaches the code below. This is the mechanism
-		// for "after restore, inject fresh session state" (design §7.4):
-		//   - Autonomous mode (Phase 1): Kuasar sends COMMIT directly; EnvOverrides is
+		// the handshake with the sandbox runtime, and reaches the code below. This is
+		// the mechanism for "after restore, inject fresh session state" (design §7.4):
+		//   - Autonomous mode (Phase 1): the runtime sends COMMIT directly; EnvOverrides is
 		//     empty, so no session-specific env vars are applied.
-		//   - Injection mode (Phase 2): Kuasar sends PREPARE with per-session env vars
+		//   - Injection mode (Phase 2): the runtime sends PREPARE with per-session env vars
 		//     before COMMIT; those overrides are applied below via os.Setenv.
 		result, err := picod.WaitForHandshake(ctx, "")
 		if err != nil {

@@ -14,18 +14,50 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package driver defines the Driver interface and capability-specific interfaces
-// (e.g. SnapshotDriver) used by all node-agent driver implementations.
-// New capability types follow the same pattern: define an interface in a dedicated
-// file (e.g. migration.go) that embeds Driver, then add a corresponding helper
-// method on Registry (e.g. MigrationDrivers).
+// Package driver defines the Driver and SnapshotDriver interfaces used by all
+// node-agent driver implementations.
+//
+// The design follows the Container Storage Interface (CSI) pattern:
+//   - Driver is the Identity Service: every driver implements GetPluginInfo,
+//     GetPluginCapabilities, and Probe.
+//   - SnapshotDriver extends Driver with snapshot lifecycle operations
+//     (CreateSnapshot, DeleteSnapshot, ListSnapshots), analogous to the CSI
+//     Controller Service snapshot RPCs.
+//   - One agentd process corresponds to one driver (no registry).
 package driver
 
-// Driver is the minimal interface implemented by every node-agent driver.
-// It carries only the identity; capability-specific interfaces (e.g. SnapshotDriver)
-// extend it with the actual operations. Use type assertions or Registry helper
-// methods (e.g. Registry.SnapshotDrivers) to obtain a capability-specific view.
+import "context"
+
+// Driver is the Identity Service interface implemented by every node-agent driver.
+// It mirrors the CSI Identity Service: GetPluginInfo, GetPluginCapabilities, Probe.
 type Driver interface {
-	// Name returns the stable provider name (e.g. "snapstart.kuasar.io").
-	Name() string
+	// GetPluginInfo returns the name and version of this driver.
+	GetPluginInfo(ctx context.Context) (*PluginInfo, error)
+
+	// GetPluginCapabilities returns the snapshot modes this driver supports.
+	GetPluginCapabilities(ctx context.Context) ([]PluginCapability, error)
+
+	// Probe verifies that the driver's backend is reachable and ready.
+	Probe(ctx context.Context) error
+}
+
+// PluginInfo carries identity details for a driver implementation.
+type PluginInfo struct {
+	Name    string
+	Version string
+}
+
+// PluginCapabilityType identifies a snapshot mode capability a driver may advertise.
+type PluginCapabilityType int32
+
+const (
+	PluginCapabilityUnknown      PluginCapabilityType = 0
+	PluginCapabilityWarmFork     PluginCapabilityType = 1 // Fork mode
+	PluginCapabilityContinuation PluginCapabilityType = 2 // Resume mode
+)
+
+// PluginCapability wraps a PluginCapabilityType, matching the CSI PluginCapability
+// message pattern so the type is extensible without breaking callers.
+type PluginCapability struct {
+	Type PluginCapabilityType
 }

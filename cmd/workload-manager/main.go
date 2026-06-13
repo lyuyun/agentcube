@@ -54,7 +54,7 @@ func init() {
 func main() {
 	var (
 		port             = flag.String("port", "8080", "API server port")
-		runtimeClassName = flag.String("runtime-class-name", "kuasar-vmm", "RuntimeClassName for sandbox pods")
+		runtimeClassName = flag.String("runtime-class-name", "", "RuntimeClassName for sandbox pods (must be set to match the installed sandbox runtime)")
 		enableTLS        = flag.Bool("enable-tls", false, "Enable TLS (HTTPS)")
 		tlsCert          = flag.String("tls-cert", "", "Path to TLS certificate file")
 		tlsKey           = flag.String("tls-key", "", "Path to TLS key file")

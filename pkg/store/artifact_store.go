@@ -109,18 +109,8 @@ type SnapshotArtifact struct {
 	// CreatedAt is set when the artifact was successfully created.
 	CreatedAt *time.Time `json:"createdAt,omitempty"`
 
-	// Retry records the build retry state for this artifact.
-	Retry *SnapshotBuildRetry `json:"retry,omitempty"`
-
 	// Message is a human-readable description of the current phase.
 	Message string `json:"message,omitempty"`
-}
-
-// SnapshotBuildRetry records retry state for a failed artifact build.
-type SnapshotBuildRetry struct {
-	FailureCount int32      `json:"failureCount,omitempty"`
-	LastFailedAt *time.Time `json:"lastFailedAt,omitempty"`
-	NextRetryAt  *time.Time `json:"nextRetryAt,omitempty"`
 }
 
 // SnapshotArtifactPhase mirrors the CRD type for artifact-store records.

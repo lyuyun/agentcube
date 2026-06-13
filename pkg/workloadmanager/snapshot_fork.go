@@ -60,6 +60,7 @@ func (h *ForkModeHandler) ComputeHash(ctx context.Context, ss *runtimev1alpha1.S
 	tmpl := &extensionsv1alpha1.SandboxTemplate{}
 	if err := h.Client.Get(ctx, types.NamespacedName{Name: ss.Spec.SourceRef.Name, Namespace: ss.Namespace}, tmpl); err != nil {
 		if apierrors.IsNotFound(err) {
+			h.recordWarningEvent(ss, "SourceTemplateNotFound", fmt.Sprintf("source SandboxTemplate %q not found", ss.Spec.SourceRef.Name))
 			return "", fmt.Errorf("source SandboxTemplate %q not found", ss.Spec.SourceRef.Name)
 		}
 		return "", fmt.Errorf("get source SandboxTemplate %q: %w", ss.Spec.SourceRef.Name, err)
@@ -82,27 +83,13 @@ func (h *ForkModeHandler) PrepareArtifactSet(ctx context.Context, ss *runtimev1a
 }
 
 func (h *ForkModeHandler) EnsureTasks(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, sc *runtimev1alpha1.SnapshotClass, manifest *store.SnapshotArtifactManifest, ownerKey, rawVersion, workingKey string, artifactSet store.SnapshotArtifactSet) (string, error) {
-	// Reset failed artifacts whose retry backoff has elapsed so they can be re-dispatched.
-	retryDue := retryDueNodes(artifactSet.Artifacts)
-	if len(retryDue) > 0 {
-		kept := artifactSet.Artifacts[:0]
-		for _, art := range artifactSet.Artifacts {
-			if _, due := retryDue[art.NodeName]; !due {
-				kept = append(kept, art)
-			}
-		}
-		artifactSet.Artifacts = kept
-		manifest.ArtifactSets[workingKey] = artifactSet
-		var err error
-		rawVersion, err = saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
-		if err != nil {
-			return rawVersion, err
-		}
-	}
-
 	targetNodes, err := h.selectTargetNodes(ctx, ss, sc)
 	if err != nil {
 		return rawVersion, fmt.Errorf("select target nodes: %w", err)
+	}
+	if len(targetNodes) == 0 {
+		h.recordWarningEvent(ss, "NoTargetNodes", "no target nodes matched providerName/nodeSelector/tolerations")
+		return rawVersion, nil
 	}
 	coveredNodes := coveredArtifactNodes(artifactSet.Artifacts)
 	addedArtifacts := false
@@ -129,23 +116,6 @@ func (h *ForkModeHandler) EnsureTasks(ctx context.Context, ss *runtimev1alpha1.S
 	return saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
 }
 
-// retryDueNodes returns the set of node names whose failed artifacts have passed their retry time.
-func retryDueNodes(artifacts []store.SnapshotArtifact) map[string]struct{} {
-	now := time.Now()
-	due := make(map[string]struct{})
-	for _, art := range artifacts {
-		if art.Phase != store.SnapshotArtifactPhaseFailed {
-			continue
-		}
-		if art.Retry == nil || art.Retry.NextRetryAt == nil {
-			continue
-		}
-		if !now.Before(*art.Retry.NextRetryAt) {
-			due[art.NodeName] = struct{}{}
-		}
-	}
-	return due
-}
 
 func (h *ForkModeHandler) ReadyToPromote(pending store.SnapshotArtifactSet) bool {
 	return anyNodeArtifactReady(pending.Artifacts)
@@ -210,10 +180,14 @@ func (h *ForkModeHandler) clearStaleActiveSet(ctx context.Context, ss *runtimev1
 		return rawVersion, nil
 	}
 	log.FromContext(ctx).Info("snapshot hash changed, clearing active artifact set", "snapshot", ss.Name)
-	h.Recorder.Event(ss, corev1.EventTypeNormal, "SandboxSnapshotRebuilding", "source change detected; clearing active artifact set")
 	manifest.ActiveSetRef = store.SnapshotArtifactSetRef{}
 	delete(manifest.ArtifactSets, activeSet.SnapshotKey)
-	return saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
+	newVersion, err := saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
+	if err != nil {
+		return rawVersion, err
+	}
+	h.Recorder.Event(ss, corev1.EventTypeNormal, "SandboxSnapshotRebuilding", "source change detected; clearing active artifact set")
+	return newVersion, nil
 }
 
 func (h *ForkModeHandler) maybeStartBackgroundRebuild(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, manifest *store.SnapshotArtifactManifest, ownerKey, rawVersion, currentHash string) (string, error) {
@@ -227,10 +201,14 @@ func (h *ForkModeHandler) maybeStartBackgroundRebuild(ctx context.Context, ss *r
 		return rawVersion, nil
 	}
 	log.FromContext(ctx).Info("rebuildAfter elapsed, starting background replacement", "snapshot", ss.Name)
-	h.Recorder.Event(ss, corev1.EventTypeNormal, "SandboxSnapshotRebuilding", "rebuildAfter elapsed; starting background replacement")
 	pendingKey := startNewArtifactSet(ss, manifest, currentHash)
 	manifest.PendingSetRef = store.SnapshotArtifactSetRef{SnapshotKey: pendingKey}
-	return saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
+	newVersion, err := saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
+	if err != nil {
+		return rawVersion, err
+	}
+	h.Recorder.Event(ss, corev1.EventTypeNormal, "SandboxSnapshotRebuilding", "rebuildAfter elapsed; starting background replacement")
+	return newVersion, nil
 }
 
 func (h *ForkModeHandler) ensurePendingSet(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, manifest *store.SnapshotArtifactManifest, ownerKey, rawVersion, currentHash string) (string, error) {
@@ -238,16 +216,21 @@ func (h *ForkModeHandler) ensurePendingSet(ctx context.Context, ss *runtimev1alp
 		return rawVersion, nil
 	}
 	log.FromContext(ctx).Info("no active artifact set, starting initial build", "snapshot", ss.Name)
-	h.Recorder.Event(ss, corev1.EventTypeNormal, "SandboxSnapshotCreating", "starting initial snapshot build")
 	pendingKey := startNewArtifactSet(ss, manifest, currentHash)
 	manifest.PendingSetRef = store.SnapshotArtifactSetRef{SnapshotKey: pendingKey}
-	return saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
+	newVersion, err := saveManifest(ctx, h.ArtifactStore, ownerKey, manifest, rawVersion)
+	if err != nil {
+		return rawVersion, err
+	}
+	h.Recorder.Event(ss, corev1.EventTypeNormal, "SandboxSnapshotCreating", "starting initial snapshot build")
+	return newVersion, nil
 }
 
 func (h *ForkModeHandler) selectTargetNodes(ctx context.Context, ss *runtimev1alpha1.SandboxSnapshot, sc *runtimev1alpha1.SnapshotClass) ([]string, error) {
 	tmpl := &extensionsv1alpha1.SandboxTemplate{}
 	if err := h.Client.Get(ctx, types.NamespacedName{Name: ss.Spec.SourceRef.Name, Namespace: ss.Namespace}, tmpl); err != nil {
 		if apierrors.IsNotFound(err) {
+			h.recordWarningEvent(ss, "SourceTemplateNotFound", fmt.Sprintf("source SandboxTemplate %q not found", ss.Spec.SourceRef.Name))
 			return nil, fmt.Errorf("source SandboxTemplate %q not found", ss.Spec.SourceRef.Name)
 		}
 		return nil, fmt.Errorf("get source SandboxTemplate %q: %w", ss.Spec.SourceRef.Name, err)
@@ -458,19 +441,7 @@ func (h *ForkModeHandler) ensureBuildSandboxAndTask(ctx context.Context, ss *run
 	existingTask := &runtimev1alpha1.SandboxSnapshotTask{}
 	err := h.Client.Get(ctx, types.NamespacedName{Name: taskName, Namespace: ss.Namespace}, existingTask)
 	if err == nil {
-		phase := existingTask.Status.Phase
-		if phase == runtimev1alpha1.SnapshotArtifactPhaseFailed || phase == runtimev1alpha1.SnapshotArtifactPhaseUnavailable {
-			// Task is terminal. If already terminating, wait for GC before recreating.
-			if existingTask.DeletionTimestamp != nil {
-				return false, nil
-			}
-			if err := h.Client.Delete(ctx, existingTask); err != nil && !apierrors.IsNotFound(err) {
-				return false, fmt.Errorf("delete terminal task for retry %s: %w", taskName, err)
-			}
-			// Deletion is now in flight; a new task will be created on the next reconcile.
-			return false, nil
-		}
-		// Non-terminal task already exists; just ensure the build sandbox is present.
+		// Task already exists; just ensure the build sandbox is present.
 		_, err = h.ensureBuildSandbox(ctx, ss, sc, snapshotKey, nodeName, sbName)
 		return false, err
 	}
@@ -534,7 +505,7 @@ func (h *ForkModeHandler) ensureBuildSandbox(ctx context.Context, ss *runtimev1a
 
 		// Copy pod template metadata from the source template, then merge
 		// SnapshotClass.BuildPodAnnotations on top. This keeps provider-specific
-		// annotations (e.g. kuasar.io/*) out of the workload manager's code.
+		// annotations out of the workload manager's code.
 		podMeta := tmpl.Spec.PodTemplate.ObjectMeta.DeepCopy()
 		if len(sc.Spec.BuildPodAnnotations) > 0 {
 			if podMeta.Annotations == nil {
@@ -726,6 +697,13 @@ func metaWithLabels(name, namespace string, lbls map[string]string) metav1.Objec
 		Namespace: namespace,
 		Labels:    lbls,
 	}
+}
+
+func (h *ForkModeHandler) recordWarningEvent(obj client.Object, reason, message string) {
+	if h == nil || h.Recorder == nil || obj == nil {
+		return
+	}
+	h.Recorder.Event(obj, corev1.EventTypeWarning, reason, message)
 }
 
 // lookupActiveForkSnapshotKey returns the active snapshot key for a Fork-mode

@@ -30,22 +30,30 @@ import (
 	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
 )
 
-// AdvertiseDriverCapabilities patches the node with snapshot provider capability labels
-// derived from the registered SnapshotDrivers. Each driver that reports at least one
-// supported mode gets a label of the form:
+// AdvertiseDriverCapabilities patches the node with snapshot provider capability
+// labels derived from the driver's GetPluginInfo and GetPluginCapabilities.
+// The label format is:
 //
 //	agentcube.volcano.sh/snapshot-provider.<driver-name>=true
 //
-// Labels for providers no longer registered are removed so that stale nodes are not
-// selected for snapshot builds after a driver is removed.
-func AdvertiseDriverCapabilities(ctx context.Context, cs kubernetes.Interface, nodeName string, drivers map[string]SnapshotDriver) error {
-	// Build the desired provider label set.
-	desired := make(map[string]string, len(drivers))
-	for _, d := range drivers {
-		caps := d.Capabilities(ctx)
-		if len(caps.SnapshotModes) > 0 {
-			desired[runtimev1alpha1.SnapshotProviderLabelPrefix+d.Name()] = "true"
-		}
+// Stale provider labels (from a previously installed driver) are removed so that
+// the node is not selected for snapshot builds by an uninstalled provider.
+func AdvertiseDriverCapabilities(ctx context.Context, cs kubernetes.Interface, nodeName string, driver SnapshotDriver) error {
+	info, err := driver.GetPluginInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("get plugin info: %w", err)
+	}
+
+	caps, err := driver.GetPluginCapabilities(ctx)
+	if err != nil {
+		return fmt.Errorf("get plugin capabilities: %w", err)
+	}
+
+	// Build the desired provider label: present only when the driver advertises
+	// at least one capability.
+	desired := make(map[string]string)
+	if len(caps) > 0 {
+		desired[runtimev1alpha1.SnapshotProviderLabelPrefix+info.Name] = "true"
 	}
 
 	// Read the current node to find stale provider labels.
@@ -55,7 +63,7 @@ func AdvertiseDriverCapabilities(ctx context.Context, cs kubernetes.Interface, n
 	}
 
 	// Compute the merge-patch: set desired labels, null-delete stale ones.
-	patchLabels := make(map[string]interface{}, len(desired))
+	patchLabels := make(map[string]interface{})
 	for k, v := range desired {
 		patchLabels[k] = v
 	}

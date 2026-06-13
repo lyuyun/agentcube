@@ -47,8 +47,8 @@ func TestConvertToPodTemplate_RuntimeClassName(t *testing.T) {
 		},
 		{
 			name:             "valid value should remain unchanged",
-			runtimeClassName: ptr.To("kuasar-vmm"),
-			expected:         ptr.To("kuasar-vmm"),
+			runtimeClassName: ptr.To("vmm-sandbox"),
+			expected:         ptr.To("vmm-sandbox"),
 			description:      "When RuntimeClassName has a valid value, it should remain unchanged",
 		},
 	}

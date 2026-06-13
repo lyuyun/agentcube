@@ -31,8 +31,6 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	agentdriver "github.com/volcano-sh/agentcube/pkg/agentd/driver"
-	// Register all built-in snapshot drivers via their init() functions.
-	_ "github.com/volcano-sh/agentcube/pkg/agentd/driver/all"
 	agentcontroller "github.com/volcano-sh/agentcube/pkg/agentd/controller"
 	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
 )
@@ -71,11 +69,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	registry, err := agentdriver.BuildDefaultRegistry()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "unable to build driver registry: %v\n", err)
-		os.Exit(1)
-	}
+	driver := agentdriver.NewGRPCDriver(os.Getenv("DRIVER_SOCKET"))
 
 	// Advertise snapshot capabilities on the node before controllers start so that
 	// the workload manager can select this node for snapshot builds immediately.
@@ -85,18 +79,18 @@ func main() {
 		os.Exit(1)
 	}
 	ctx := ctrl.SetupSignalHandler()
-	if err := agentdriver.AdvertiseDriverCapabilities(ctx, cs, nodeName, registry.SnapshotDrivers()); err != nil {
+	if err := agentdriver.AdvertiseDriverCapabilities(ctx, cs, nodeName, driver); err != nil {
 		fmt.Fprintf(os.Stderr, "unable to advertise driver capabilities: %v\n", err)
 		os.Exit(1)
 	}
 
-	snapshotTaskController := &agentcontroller.SnapshotTaskController{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		NodeName: nodeName,
-		Drivers:  registry.SnapshotDrivers(),
-	}
-	if err := snapshotTaskController.SetupWithManager(mgr); err != nil {
+	if err := (&agentcontroller.SnapshotTaskController{
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		NodeName:  nodeName,
+		Driver:    driver,
+	}).SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "unable to create snapshot task controller: %v\n", err)
 		os.Exit(1)
 	}

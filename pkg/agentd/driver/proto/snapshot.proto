@@ -1,0 +1,64 @@
+syntax = "proto3";
+package ssi.v1alpha1;
+
+option go_package = "github.com/volcano-sh/agentcube/pkg/agentd/driver/proto";
+
+// SSI — Sandbox Snapshot Interface
+// Snapshot artifact lifecycle: plugin introspection + snapshot CRUD.
+service SandboxSnapshotController {
+    rpc GetPluginInfo         (GetPluginInfoRequest)             returns (GetPluginInfoResponse);
+    rpc GetPluginCapabilities (GetPluginCapabilitiesRequest)     returns (GetPluginCapabilitiesResponse);
+    rpc Probe                 (ProbeRequest)                     returns (ProbeResponse);
+    rpc CreateSandboxSnapshot (CreateSandboxSnapshotRequest)     returns (CreateSandboxSnapshotResponse);
+    rpc DeleteSandboxSnapshot (DeleteSandboxSnapshotRequest)     returns (DeleteSandboxSnapshotResponse);
+    rpc ListSandboxSnapshots  (ListSandboxSnapshotsRequest)      returns (ListSandboxSnapshotsResponse);
+    rpc GetSandboxSnapshot    (GetSandboxSnapshotRequest)        returns (GetSandboxSnapshotResponse);
+}
+
+// UNSPECIFIED (0) is the proto3 default zero value; in list context returns all types.
+enum SnapshotMode {
+    UNSPECIFIED = 0;
+    FORK        = 1;  // Fork the sandbox VM state into a reusable snapshot.
+    RESUME      = 2;  // Save a resumable checkpoint for continuation.
+}
+
+message CreateSandboxSnapshotRequest {
+    string pod_uid       = 1;
+    string snapshot_name = 2;
+    SnapshotMode mode    = 3;
+    // Extra parameters for runtime-specific extensions.
+    map<string, string> parameters = 4;
+}
+message CreateSandboxSnapshotResponse { SandboxSnapshot snapshot = 1; }
+
+message DeleteSandboxSnapshotRequest  { string snapshot_name = 1; }
+message DeleteSandboxSnapshotResponse {}
+
+message GetSandboxSnapshotRequest  { string snapshot_name = 1; }
+message GetSandboxSnapshotResponse { SandboxSnapshot snapshot = 1; }
+
+// mode = UNSPECIFIED (default) lists all types.
+message ListSandboxSnapshotsRequest  { SnapshotMode mode = 1; }
+message ListSandboxSnapshotsResponse { repeated SandboxSnapshot snapshots = 1; }
+
+message SandboxSnapshot {
+    string pod_uid       = 1;
+    string snapshot_name = 2;
+    SnapshotMode mode    = 3;
+}
+
+message GetPluginInfoRequest  {}
+message GetPluginInfoResponse { string name = 1; string version = 2; }
+
+message GetPluginCapabilitiesRequest  {}
+message GetPluginCapabilitiesResponse { repeated PluginCapability capabilities = 1; }
+
+enum PluginCapabilityType {
+    PLUGIN_UNKNOWN      = 0;
+    PLUGIN_FORK         = 1;
+    PLUGIN_RESUME       = 2;
+}
+message PluginCapability { PluginCapabilityType type = 1; }
+
+message ProbeRequest  {}
+message ProbeResponse { bool ready = 1; }

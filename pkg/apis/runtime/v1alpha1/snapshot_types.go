@@ -52,8 +52,8 @@ type SnapshotClassSpec struct {
 
 	// BuildPodAnnotations are annotations applied verbatim to the build
 	// Sandbox's pod template when creating a snapshot. Use this field for
-	// provider-specific pod annotations (e.g. kuasar.io/* for WarmFork
-	// readiness) so that the generic workload manager remains provider-agnostic.
+	// provider-specific pod annotations so that the generic workload manager
+	// remains provider-agnostic.
 	// +optional
 	BuildPodAnnotations map[string]string `json:"buildPodAnnotations,omitempty"`
 }
@@ -275,7 +275,7 @@ const (
 
 	// SnapshotProviderLabelPrefix is prepended by the provider name to form a node label
 	// advertising provider capability.
-	// Example: agentcube.volcano.sh/snapshot-provider.snapstart.kuasar.io=true
+	// Example: agentcube.volcano.sh/snapshot-provider.vmm-snapstart=true
 	SnapshotProviderLabelPrefix = "agentcube.volcano.sh/snapshot-provider."
 )
 

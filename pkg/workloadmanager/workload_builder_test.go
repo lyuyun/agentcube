@@ -330,7 +330,7 @@ func TestBuildCodeInterpreterPodTemplate_SnapstartIsolation(t *testing.T) {
 	// Restore sessions get sessionGate=true from the snapshot's process memory and run
 	// the WarmFork handshake without this env var in the PodSpec.
 	// Cold-start sessions (no active snapshot) must NOT block on the WarmFork handshake;
-	// if this env var were here, every cold-start session would wait for Kuasar.
+	// if this env var were here, every cold-start session would block on the WarmFork handshake.
 	if _, found := envMap["AGENTCUBE_SESSION_GATE"]; found {
 		t.Error("AGENTCUBE_SESSION_GATE must not be in the session Sandbox template")
 	}

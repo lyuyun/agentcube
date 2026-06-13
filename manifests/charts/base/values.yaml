@@ -58,7 +58,7 @@ workloadmanager:
   extraEnv: []
 
 # AgentCube AgentD (node daemon for SnapStart snapshot builds)
-# Enable on nodes that have Kuasar installed and should participate in snapshot builds.
+# Enable on nodes that have a sandbox runtime installed and should participate in snapshot builds.
 agentd:
   enabled: false
   image:
@@ -72,17 +72,17 @@ agentd:
     requests:
       cpu: 50m
       memory: 64Mi
-  # nodeSelector targets nodes where the runtime driver is installed.
+  # nodeSelector targets nodes where the sandbox runtime is installed.
   nodeSelector: {}
   extraEnv: []
   extraVolumes:
-    - name: kuasar-admin-socket
+    - name: sandbox-grpc-socket
       hostPath:
-        path: /run/vmm-sandboxer-admin.sock
+        path: /run/vmm-sandboxer-service.sock
         type: Socket
   extraVolumeMounts:
-    - name: kuasar-admin-socket
-      mountPath: /run/vmm-sandboxer-admin.sock
+    - name: sandbox-grpc-socket
+      mountPath: /run/vmm-sandboxer-service.sock
 
 # Volcano Agent Scheduler
 volcano:

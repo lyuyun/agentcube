@@ -17,16 +17,23 @@ limitations under the License.
 package workloadmanager
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"k8s.io/utils/ptr"
 
 	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
 	"github.com/volcano-sh/agentcube/pkg/store"
+	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
+	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 )
 
 // -- buildSnapshotKey --
@@ -104,7 +111,7 @@ const testTemplateUID = types.UID("tmpl-uid-1")
 
 func TestComputeSnapshotHash_Deterministic(t *testing.T) {
 	ss := makeTestSandboxSnapshot("snap1", "default")
-	sc := makeTestSnapshotClass("class1", "kuasar")
+	sc := makeTestSnapshotClass("class1", "vmm-snapstart")
 	podSpec := corev1.PodSpec{
 		Containers: []corev1.Container{{Name: "main", Image: "python:3.11"}},
 	}
@@ -124,7 +131,7 @@ func TestComputeSnapshotHash_Deterministic(t *testing.T) {
 
 func TestComputeSnapshotHash_UsesTemplateUID(t *testing.T) {
 	ss := makeTestSandboxSnapshot("snap1", "default")
-	sc := makeTestSnapshotClass("class1", "kuasar")
+	sc := makeTestSnapshotClass("class1", "vmm-snapstart")
 	podSpec := corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}}
 
 	h1, _ := computeSnapshotHash(ss, types.UID("tmpl-uid-A"), podSpec, sc)
@@ -143,7 +150,7 @@ func TestComputeSnapshotHash_UsesTemplateUID(t *testing.T) {
 
 func TestComputeSnapshotHash_TolerationOrderIndependent(t *testing.T) {
 	ss := makeTestSandboxSnapshot("snap1", "default")
-	sc := makeTestSnapshotClass("class1", "kuasar")
+	sc := makeTestSnapshotClass("class1", "vmm-snapstart")
 
 	tolA := corev1.Toleration{Key: "aaa", Operator: corev1.TolerationOpEqual, Value: "v1", Effect: corev1.TaintEffectNoSchedule}
 	tolB := corev1.Toleration{Key: "bbb", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute}
@@ -157,7 +164,7 @@ func TestComputeSnapshotHash_TolerationOrderIndependent(t *testing.T) {
 
 func TestComputeSnapshotHash_TolerationTieBreaker(t *testing.T) {
 	ss := makeTestSandboxSnapshot("snap1", "default")
-	sc := makeTestSnapshotClass("class1", "kuasar")
+	sc := makeTestSnapshotClass("class1", "vmm-snapstart")
 
 	tolA := corev1.Toleration{Key: "k", Operator: corev1.TolerationOpEqual, Value: "v1"}
 	tolB := corev1.Toleration{Key: "k", Operator: corev1.TolerationOpEqual, Value: "v2"}
@@ -171,7 +178,7 @@ func TestComputeSnapshotHash_TolerationTieBreaker(t *testing.T) {
 
 func TestComputeSnapshotHash_TolerationSecondsOrdering(t *testing.T) {
 	ss := makeTestSandboxSnapshot("snap1", "default")
-	sc := makeTestSnapshotClass("class1", "kuasar")
+	sc := makeTestSnapshotClass("class1", "vmm-snapstart")
 
 	tolA := corev1.Toleration{Key: "k", TolerationSeconds: ptr.To[int64](10)}
 	tolB := corev1.Toleration{Key: "k", TolerationSeconds: ptr.To[int64](20)}
@@ -185,7 +192,7 @@ func TestComputeSnapshotHash_TolerationSecondsOrdering(t *testing.T) {
 
 func TestComputeSnapshotHash_TolerationNilVsPtrZeroSeconds(t *testing.T) {
 	ss := makeTestSandboxSnapshot("snap1", "default")
-	sc := makeTestSnapshotClass("class1", "kuasar")
+	sc := makeTestSnapshotClass("class1", "vmm-snapstart")
 
 	nilSec := corev1.Toleration{Key: "k", TolerationSeconds: nil}
 	zeroSec := corev1.Toleration{Key: "k", TolerationSeconds: ptr.To[int64](0)}
@@ -200,7 +207,7 @@ func TestComputeSnapshotHash_TolerationNilVsPtrZeroSeconds(t *testing.T) {
 
 func TestComputeSnapshotHash_NodeNameIgnored(t *testing.T) {
 	ss := makeTestSandboxSnapshot("snap1", "default")
-	sc := makeTestSnapshotClass("class1", "kuasar")
+	sc := makeTestSnapshotClass("class1", "vmm-snapstart")
 
 	base := corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}}
 	withNode := base.DeepCopy()
@@ -255,4 +262,115 @@ func makeTestSnapshotClass(name, provider string) *runtimev1alpha1.SnapshotClass
 
 func makeArtifact(nodeName string, phase store.SnapshotArtifactPhase) store.SnapshotArtifact {
 	return store.SnapshotArtifact{NodeName: nodeName, Phase: phase}
+}
+
+func TestForkModeHandler_ComputeHash_SourceTemplateNotFoundEmitsEvent(t *testing.T) {
+	sch := runtime.NewScheme()
+	_ = runtimev1alpha1.AddToScheme(sch)
+	_ = extensionsv1alpha1.AddToScheme(sch)
+	_ = corev1.AddToScheme(sch)
+	_ = sandboxv1alpha1.AddToScheme(sch)
+
+	rec := record.NewFakeRecorder(10)
+	handler := &ForkModeHandler{
+		Client:   fake.NewClientBuilder().WithScheme(sch).Build(),
+		Recorder: rec,
+	}
+
+	ss := makeTestSandboxSnapshot("snap1", "default")
+	sc := makeTestSnapshotClass("class1", "snapstart.kuasar.io")
+
+	_, err := handler.ComputeHash(context.Background(), ss, sc)
+	if err == nil || !strings.Contains(err.Error(), "source SandboxTemplate") {
+		t.Fatalf("expected source template not found error, got %v", err)
+	}
+
+	select {
+	case evt := <-rec.Events:
+		if !strings.Contains(evt, "SourceTemplateNotFound") {
+			t.Fatalf("expected SourceTemplateNotFound event, got %q", evt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for warning event")
+	}
+}
+
+func TestForkModeHandler_EnsureTasks_NoTargetNodesEmitsEvent(t *testing.T) {
+	sch := runtime.NewScheme()
+	_ = runtimev1alpha1.AddToScheme(sch)
+	_ = extensionsv1alpha1.AddToScheme(sch)
+	_ = corev1.AddToScheme(sch)
+	_ = sandboxv1alpha1.AddToScheme(sch)
+
+	tmpl := &extensionsv1alpha1.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "tmpl1", Namespace: "default"},
+		Spec: extensionsv1alpha1.SandboxTemplateSpec{
+			PodTemplate: sandboxv1alpha1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "main", Image: "busybox"}},
+				},
+			},
+		},
+	}
+	rec := record.NewFakeRecorder(10)
+	handler := &ForkModeHandler{
+		Client: fake.NewClientBuilder().
+			WithScheme(sch).
+			WithObjects(tmpl).
+			Build(),
+		Recorder: rec,
+	}
+
+	ss := makeTestSandboxSnapshot("snap1", "default")
+	sc := makeTestSnapshotClass("class1", "snapstart.kuasar.io")
+	set := store.SnapshotArtifactSet{SnapshotKey: "snap1-fork-g1-r1", SnapshotHash: "sha256:test"}
+	manifest := &store.SnapshotArtifactManifest{}
+
+	_, err := handler.EnsureTasks(context.Background(), ss, sc, manifest, "owner", "", set.SnapshotKey, set)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case evt := <-rec.Events:
+		if !strings.Contains(evt, "NoTargetNodes") {
+			t.Fatalf("expected NoTargetNodes event, got %q", evt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for warning event")
+	}
+}
+
+func TestSnapshotClassToSnapshotRequests_FiltersByClassName(t *testing.T) {
+	sch := runtime.NewScheme()
+	_ = runtimev1alpha1.AddToScheme(sch)
+
+	c := fake.NewClientBuilder().
+		WithScheme(sch).
+		WithObjects(
+			&runtimev1alpha1.SandboxSnapshot{
+				ObjectMeta: metav1.ObjectMeta{Name: "snap-a", Namespace: "ns1"},
+				Spec:       runtimev1alpha1.SandboxSnapshotSpec{SnapshotClassName: "kuasar"},
+			},
+			&runtimev1alpha1.SandboxSnapshot{
+				ObjectMeta: metav1.ObjectMeta{Name: "snap-b", Namespace: "ns2"},
+				Spec:       runtimev1alpha1.SandboxSnapshotSpec{SnapshotClassName: "other"},
+			},
+			&runtimev1alpha1.SandboxSnapshot{
+				ObjectMeta: metav1.ObjectMeta{Name: "snap-c", Namespace: "ns3"},
+				Spec:       runtimev1alpha1.SandboxSnapshotSpec{SnapshotClassName: "kuasar"},
+			},
+		).
+		Build()
+
+	reqs := snapshotClassToSnapshotRequests(context.Background(), c, "kuasar")
+	if len(reqs) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(reqs))
+	}
+	if reqs[0].Namespace != "ns1" || reqs[0].Name != "snap-a" {
+		t.Fatalf("unexpected first request: %+v", reqs[0])
+	}
+	if reqs[1].Namespace != "ns3" || reqs[1].Name != "snap-c" {
+		t.Fatalf("unexpected second request: %+v", reqs[1])
+	}
 }

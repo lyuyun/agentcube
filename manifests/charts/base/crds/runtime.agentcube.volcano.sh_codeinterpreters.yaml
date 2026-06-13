@@ -395,8 +395,8 @@ spec:
                     type: object
                   runtimeClassName:
                     description: |-
-                      RuntimeClassName specifies the Kubernetes RuntimeClass used to run the sandbox
-                      (e.g., for kuasar / Kata-based isolation).
+                      RuntimeClassName specifies the Kubernetes RuntimeClass used to run
+                      the sandbox (e.g., for VMM-based isolation).
                     type: string
                 type: object
               warmPoolSize:

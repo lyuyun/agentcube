@@ -107,7 +107,7 @@ type CodeInterpreterSandboxTemplate struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 
 	// RuntimeClassName specifies the Kubernetes RuntimeClass used to run the sandbox
-	// (e.g., for kuasar / Kata-based isolation).
+	// (e.g., for VMM-based isolation).
 	// +optional
 	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 

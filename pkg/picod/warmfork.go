@@ -29,20 +29,20 @@ import (
 )
 
 const (
-	// DefaultInjectSocketPath is the Kuasar WarmFork inject socket default path.
+	// DefaultInjectSocketPath is the WarmFork inject socket default path.
 	// Override via AGENTCUBE_INJECT_SOCKET_PATH.
 	DefaultInjectSocketPath = "/run/warmfork-readiness.sock"
 
 	// injectSocketEnvVar overrides DefaultInjectSocketPath when set.
 	injectSocketEnvVar = "AGENTCUBE_INJECT_SOCKET_PATH"
 
-	// maxFrameBodySize is the Kuasar WarmFork protocol maximum frame body size.
+	// maxFrameBodySize is the WarmFork protocol maximum frame body size.
 	maxFrameBodySize = 4 << 20 // 4 MiB
 
 	warmforkProtocolVersion = "1"
 )
 
-// HandshakeResult carries the session state delivered by the Kuasar sandboxer
+// HandshakeResult carries the session state delivered by the sandbox runtime
 // during the WarmFork handshake. All fields are empty in autonomous mode.
 type HandshakeResult struct {
 	TaskID       string
@@ -50,7 +50,7 @@ type HandshakeResult struct {
 	Context      string
 }
 
-// WaitForHandshake implements the Kuasar WarmFork workload side of the
+// WaitForHandshake implements the WarmFork workload side of the
 // readiness and handshake protocol (v1).
 //
 // It opens the inject socket, then loops on Accept() to handle the

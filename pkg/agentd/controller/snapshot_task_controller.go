@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package controller implements the node-agent side of the snapshot build path.
 // It watches SandboxSnapshotTask objects assigned to this node and drives
-// snapshot creation through registered SnapshotDrivers.
+// snapshot creation through the registered SnapshotDriver.
 package controller
 
 import (
@@ -29,7 +29,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,17 +42,24 @@ import (
 	runtimev1alpha1 "github.com/volcano-sh/agentcube/pkg/apis/runtime/v1alpha1"
 )
 
-// taskBuildDeadline is the maximum time a SandboxSnapshotTask may remain
-// in a non-terminal phase before the node agent marks it Failed.
-const taskBuildDeadline = 10 * time.Minute
+const (
+	// retryMinInterval is the initial delay between driver.Create attempts.
+	retryMinInterval = 10 * time.Second
+	// retryMaxInterval is the maximum delay between driver.Create attempts.
+	retryMaxInterval = 300 * time.Second
+)
 
 // SnapshotTaskController watches SandboxSnapshotTask objects assigned to this node
-// and drives snapshot creation via the registered SnapshotDriver.
+// and drives snapshot creation via the single registered SnapshotDriver.
 type SnapshotTaskController struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	NodeName string
-	Drivers  map[string]agentdriver.SnapshotDriver
+	// APIReader bypasses the informer cache for one-shot lookups (e.g. Pod UID),
+	// avoiding the need for list/watch RBAC on those resources.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
+	NodeName  string
+	Driver    agentdriver.SnapshotDriver
 }
 
 func (r *SnapshotTaskController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -66,16 +75,9 @@ func (r *SnapshotTaskController) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
-	// Skip tasks that have already reached a terminal phase.
-	if task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseReady ||
-		task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseFailed ||
-		task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseUnavailable {
+	// Skip tasks that have already reached Ready.
+	if task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseReady {
 		return ctrl.Result{}, nil
-	}
-
-	// Enforce an absolute build deadline to prevent hung tasks.
-	if !task.CreationTimestamp.IsZero() && time.Since(task.CreationTimestamp.Time) > taskBuildDeadline {
-		return r.reportFailed(ctx, task, fmt.Sprintf("snapshot build deadline exceeded (%s)", taskBuildDeadline))
 	}
 
 	// Validate required task fields (design §14 point 5).
@@ -83,25 +85,51 @@ func (r *SnapshotTaskController) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// Select driver.
-	driver, ok := r.Drivers[task.Spec.ProviderName]
-	if !ok {
-		return r.reportFailed(ctx, task, fmt.Sprintf("no driver registered for provider %q", task.Spec.ProviderName))
+	// Verify this task targets our driver's provider name.
+	info, err := r.Driver.GetPluginInfo(ctx)
+	if err != nil {
+		return ctrl.Result{RequeueAfter: driverRetryInterval(task.CreationTimestamp.Time)}, nil
+	}
+	if task.Spec.ProviderName != info.Name {
+		logger.Info("task providerName does not match driver, skipping",
+			"task", task.Name, "taskProvider", task.Spec.ProviderName, "driverName", info.Name)
+		return ctrl.Result{}, nil
 	}
 
-	// Validate driver capabilities.
-	caps := driver.Capabilities(ctx)
-	if !containsMode(caps.SnapshotModes, task.Spec.SnapshotMode) {
-		return r.reportFailed(ctx, task, fmt.Sprintf("driver does not support snapshot mode %q", task.Spec.SnapshotMode))
+	// Verify the driver supports the requested snapshot mode.
+	caps, err := r.Driver.GetPluginCapabilities(ctx)
+	if err != nil {
+		return ctrl.Result{RequeueAfter: driverRetryInterval(task.CreationTimestamp.Time)}, nil
+	}
+	if !capSupportsMode(caps, task.Spec.SnapshotMode) {
+		msg := fmt.Sprintf("driver %q does not support snapshot mode %q", info.Name, task.Spec.SnapshotMode)
+		logger.Info(msg+", retrying", "task", task.Name)
+		r.Recorder.Event(task, corev1.EventTypeWarning, "SnapshotModeNotSupported", msg)
+		if err := r.reportCreating(ctx, task, msg); err != nil {
+			logger.Error(err, "patch task status for unsupported mode", "task", task.Name)
+		}
+		return ctrl.Result{RequeueAfter: driverRetryInterval(task.CreationTimestamp.Time)}, nil
 	}
 
-	if result, done, err := r.validateTargetSandbox(ctx, task); done || err != nil {
+	sandbox, result, done, err := r.validateTargetSandbox(ctx, task)
+	if done || err != nil {
 		return result, err
 	}
 
-	logger.Info("calling snapshot driver", "task", task.Name, "provider", task.Spec.ProviderName)
+	podUID, err := r.resolvePodUID(ctx, sandbox)
+	if err != nil {
+		msg := fmt.Sprintf("resolve pod UID for sandbox %s: %v", sandbox.Name, err)
+		logger.Info(msg+", retrying", "task", task.Name)
+		r.Recorder.Event(task, corev1.EventTypeWarning, "PodUIDNotFound", msg)
+		if patchErr := r.reportCreating(ctx, task, msg); patchErr != nil {
+			logger.Error(patchErr, "patch task status", "task", task.Name)
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 
-	artifact, err := driver.Create(ctx, agentdriver.SnapshotDriverCreateRequest{
+	logger.Info("calling snapshot driver", "task", task.Name, "provider", info.Name, "podUID", podUID)
+
+	snapshot, err := r.Driver.CreateSnapshot(ctx, agentdriver.CreateSnapshotRequest{
 		TaskRef: corev1.ObjectReference{
 			APIVersion: runtimev1alpha1.GroupVersion.String(),
 			Kind:       "SandboxSnapshotTask",
@@ -111,17 +139,22 @@ func (r *SnapshotTaskController) Reconcile(ctx context.Context, req ctrl.Request
 		},
 		TargetSandboxRef: task.Spec.TargetSandboxRef,
 		TargetNodeName:   task.Spec.TargetNodeName,
-		SnapshotMode:     task.Spec.SnapshotMode,
-		ProviderName:     task.Spec.ProviderName,
-		SnapshotKey:      task.Spec.SnapshotKey,
+		SnapshotName:     task.Spec.SnapshotKey,
 		SnapshotHash:     task.Spec.SnapshotHash,
+		Mode:             task.Spec.SnapshotMode,
+		PodUID:           podUID,
 	})
 	if err != nil {
-		logger.Error(err, "snapshot driver create failed", "task", task.Name)
-		return r.reportFailed(ctx, task, err.Error())
+		logger.Error(err, "snapshot driver create failed, retrying", "task", task.Name)
+		r.Recorder.Event(task, corev1.EventTypeWarning, "DriverCreateFailed", err.Error())
+		if patchErr := r.reportCreating(ctx, task, err.Error()); patchErr != nil {
+			logger.Error(patchErr, "patch task status after driver create failure", "task", task.Name)
+		}
+		return ctrl.Result{RequeueAfter: driverRetryInterval(task.CreationTimestamp.Time)}, nil
 	}
 
-	logger.Info("snapshot driver create succeeded", "task", task.Name, "snapshotKey", artifact.SnapshotKey)
+	logger.Info("snapshot created", "task", task.Name, "snapshotName", snapshot.SnapshotName)
+	r.Recorder.Event(task, corev1.EventTypeNormal, "SnapshotCreated", "snapshot driver create succeeded")
 	return r.reportReady(ctx, task)
 }
 
@@ -139,43 +172,87 @@ func (r *SnapshotTaskController) validateTask(ctx context.Context, task *runtime
 
 // validateTargetSandbox waits until the target Sandbox has the Ready condition before
 // allowing the driver to proceed. All snapshot modes require a running sandbox.
-func (r *SnapshotTaskController) validateTargetSandbox(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask) (ctrl.Result, bool, error) {
+func (r *SnapshotTaskController) validateTargetSandbox(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask) (*sandboxv1alpha1.Sandbox, ctrl.Result, bool, error) {
 	sandbox := &sandboxv1alpha1.Sandbox{}
 	err := r.Get(ctx, types.NamespacedName{Name: task.Spec.TargetSandboxRef.Name, Namespace: task.Namespace}, sandbox)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+			return nil, ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
 		}
-		return ctrl.Result{}, true, fmt.Errorf("get sandbox %s/%s: %w", task.Namespace, task.Spec.TargetSandboxRef.Name, err)
+		return nil, ctrl.Result{}, true, fmt.Errorf("get sandbox %s/%s: %w", task.Namespace, task.Spec.TargetSandboxRef.Name, err)
 	}
 	for _, cond := range sandbox.Status.Conditions {
 		if cond.Type == string(sandboxv1alpha1.SandboxConditionReady) && cond.Status == metav1.ConditionTrue {
-			return ctrl.Result{}, false, nil
+			return sandbox, ctrl.Result{}, false, nil
 		}
 	}
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+	return nil, ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+}
+
+// resolvePodUID returns the UID of the running Pod backing the given Sandbox.
+// Without warm pool the pod name equals the sandbox name; with warm pool it is
+// stored in the agents.x-k8s.io/pod-name annotation.
+func (r *SnapshotTaskController) resolvePodUID(ctx context.Context, sandbox *sandboxv1alpha1.Sandbox) (string, error) {
+	podName := sandbox.Name
+	if annotated, ok := sandbox.Annotations[sandboxcontrollers.SandboxPodNameAnnotation]; ok && annotated != "" {
+		podName = annotated
+	}
+
+	pod := &corev1.Pod{}
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: podName, Namespace: sandbox.Namespace}, pod); err != nil {
+		return "", fmt.Errorf("get pod %s/%s for sandbox %s: %w", sandbox.Namespace, podName, sandbox.Name, err)
+	}
+	if pod.Status.Phase != corev1.PodRunning || string(pod.UID) == "" {
+		return "", fmt.Errorf("pod %s/%s is not running (phase=%s)", sandbox.Namespace, podName, pod.Status.Phase)
+	}
+	return string(pod.UID), nil
 }
 
 func (r *SnapshotTaskController) reportReady(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask) (ctrl.Result, error) {
-	return ctrl.Result{}, r.patchTaskStatus(ctx, task, runtimev1alpha1.SnapshotArtifactPhaseReady, "")
-}
-
-func (r *SnapshotTaskController) reportFailed(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask, msg string) (ctrl.Result, error) {
-	return ctrl.Result{}, r.patchTaskStatus(ctx, task, runtimev1alpha1.SnapshotArtifactPhaseFailed, msg)
-}
-
-func (r *SnapshotTaskController) patchTaskStatus(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask, phase runtimev1alpha1.SnapshotArtifactPhase, msg string) error {
 	patch := client.MergeFrom(task.DeepCopy())
 	now := metav1.Now()
-	task.Status.Phase = phase
-	task.Status.Message = msg
+	task.Status.Phase = runtimev1alpha1.SnapshotArtifactPhaseReady
+	task.Status.Message = ""
 	task.Status.ObservedAt = &now
+	return ctrl.Result{}, r.Status().Patch(ctx, task, patch)
+}
+
+func (r *SnapshotTaskController) reportCreating(ctx context.Context, task *runtimev1alpha1.SandboxSnapshotTask, msg string) error {
+	if task.Status.Phase == runtimev1alpha1.SnapshotArtifactPhaseCreating && task.Status.Message == msg {
+		return nil
+	}
+	patch := client.MergeFrom(task.DeepCopy())
+	task.Status.Phase = runtimev1alpha1.SnapshotArtifactPhaseCreating
+	task.Status.Message = msg
 	return r.Status().Patch(ctx, task, patch)
 }
 
-func containsMode(modes []runtimev1alpha1.SandboxSnapshotMode, mode runtimev1alpha1.SandboxSnapshotMode) bool {
-	for _, m := range modes {
-		if m == mode {
+// driverRetryInterval returns the next retry delay using task age as a
+// stateless proxy for attempt count: doubles every minute from
+// retryMinInterval, capped at retryMaxInterval.
+func driverRetryInterval(createdAt time.Time) time.Duration {
+	steps := int(time.Since(createdAt) / time.Minute)
+	d := retryMinInterval
+	for i := 0; i < steps && d < retryMaxInterval; i++ {
+		d *= 2
+	}
+	if d > retryMaxInterval {
+		return retryMaxInterval
+	}
+	return d
+}
+
+// capSupportsMode checks whether the capability list includes support for the given mode.
+func capSupportsMode(caps []agentdriver.PluginCapability, mode runtimev1alpha1.SandboxSnapshotMode) bool {
+	want := agentdriver.PluginCapabilityUnknown
+	switch mode {
+	case runtimev1alpha1.SandboxSnapshotModeFork:
+		want = agentdriver.PluginCapabilityWarmFork
+	case runtimev1alpha1.SandboxSnapshotModeResume:
+		want = agentdriver.PluginCapabilityContinuation
+	}
+	for _, c := range caps {
+		if c.Type == want {
 			return true
 		}
 	}
@@ -184,6 +261,8 @@ func containsMode(modes []runtimev1alpha1.SandboxSnapshotMode, mode runtimev1alp
 
 // SetupWithManager registers the controller with the Manager.
 func (r *SnapshotTaskController) SetupWithManager(mgr ctrl.Manager) error {
+	r.Recorder = mgr.GetEventRecorderFor("snapshot-task-controller")
+
 	nodeFilter := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		task, ok := obj.(*runtimev1alpha1.SandboxSnapshotTask)
 		if !ok {
